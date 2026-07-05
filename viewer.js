@@ -2,38 +2,7 @@
   const ROOM_ID = "main";
   const RETRY_MS = 2500;
   const READY_MS = 3000;
-  const OFFER_RETRY_MS = 9000;
-  const CONNECT_TIMEOUT_MS = 12000;
-  const ICE_SERVERS = [
-    { urls: "stun:stun.l.google.com:19302" },
-    { urls: "stun:stun1.l.google.com:19302" },
-    { urls: "stun:openrelay.metered.ca:80" },
-    {
-      urls: "turn:openrelay.metered.ca:80",
-      username: "openrelayproject",
-      credential: "openrelayproject"
-    },
-    {
-      urls: "turn:openrelay.metered.ca:80?transport=tcp",
-      username: "openrelayproject",
-      credential: "openrelayproject"
-    },
-    {
-      urls: "turn:openrelay.metered.ca:443",
-      username: "openrelayproject",
-      credential: "openrelayproject"
-    },
-    {
-      urls: "turn:openrelay.metered.ca:443?transport=tcp",
-      username: "openrelayproject",
-      credential: "openrelayproject"
-    },
-    {
-      urls: "turns:openrelay.metered.ca:443",
-      username: "openrelayproject",
-      credential: "openrelayproject"
-    }
-  ];
+  const MAX_BUFFER_SECONDS = 20;
 
   const video = document.querySelector("#streamVideo");
   const emptyState = document.querySelector("#emptyState");
@@ -46,21 +15,16 @@
 
   const state = {
     socket: null,
-    viewerId: "",
-    rtc: null,
-    remoteStream: null,
-    pendingCandidates: [],
+    mediaSource: null,
+    sourceBuffer: null,
+    objectUrl: "",
+    queue: [],
     reconnectTimer: null,
     readyTimer: null,
-    offerTimer: null,
-    connectTimer: null,
-    rtcStartedAt: 0,
-    forceRelay: false,
     muted: true,
-    hasAudio: false,
     isLive: false,
-    wantsLive: false,
-    senderOnline: false
+    senderOnline: false,
+    mimeType: ""
   };
 
   video.controls = false;
@@ -68,9 +32,8 @@
   video.addEventListener("contextmenu", (event) => event.preventDefault());
   muteButton.addEventListener("click", toggleMute);
   window.addEventListener("beforeunload", () => {
-    if (state.socket) {
-      state.socket.close();
-    }
+    closeSocket();
+    resetMedia();
   });
 
   connectSocket();
@@ -81,7 +44,8 @@
     closeSocket();
     setStatus("Verbindung wird aufgebaut");
 
-    const socket = new WebSocket(getSocketUrl("viewer"));
+    const socket = new WebSocket(getSocketUrl());
+    socket.binaryType = "arraybuffer";
     state.socket = socket;
 
     socket.addEventListener("open", () => {
@@ -92,22 +56,23 @@
     });
 
     socket.addEventListener("message", (event) => {
+      if (typeof event.data !== "string") {
+        handleMediaChunk(event.data);
+        return;
+      }
+
       const message = parseMessage(event.data);
 
-      if (message.type === "welcome") {
-        state.viewerId = message.viewerId || "";
+      if (message.type === "sender-state") {
+        handleSenderState(message);
       }
 
-      if (message.type === "stream-state") {
-        handleStreamState(message);
+      if (message.type === "media-start") {
+        handleMediaStart(message);
       }
 
-      if (message.type === "answer") {
-        handleAnswer(message.payload);
-      }
-
-      if (message.type === "ice") {
-        addRemoteCandidate(message.payload);
+      if (message.type === "media-stop") {
+        handleMediaStop(message);
       }
     });
 
@@ -117,10 +82,9 @@
       }
 
       stopReadyLoop();
-      resetRtc();
+      resetMedia();
       state.socket = null;
       state.senderOnline = false;
-      state.wantsLive = false;
       setEmpty("Sender wird gesucht");
       setStatus("Verbindung getrennt");
       scheduleReconnect();
@@ -131,218 +95,164 @@
     });
   }
 
-  function handleStreamState(message) {
+  function handleSenderState(message) {
     state.senderOnline = Boolean(message.online);
-    state.wantsLive = Boolean(message.live);
 
     if (!state.senderOnline) {
-      resetRtc();
+      resetMedia();
       setEmpty("Sender wird gesucht");
       setStatus("Sender offline");
       return;
     }
 
-    if (!state.wantsLive) {
-      resetRtc();
+    if (!message.live && !state.isLive) {
       setEmpty("Warte auf Stream");
       setStatus("Sender verbunden");
-      return;
-    }
-
-    setStatus("Verbinde");
-    state.forceRelay = false;
-    requestOffer();
-  }
-
-  function requestOffer() {
-    if (state.offerTimer) {
-      return;
-    }
-
-    state.offerTimer = window.setTimeout(() => {
-      state.offerTimer = null;
-      createOffer();
-    }, 200);
-  }
-
-  async function createOffer() {
-    if (!isSocketOpen()) {
-      return;
-    }
-
-    if (state.rtc && !["failed", "closed", "disconnected"].includes(state.rtc.connectionState)) {
-      if (Date.now() - state.rtcStartedAt < OFFER_RETRY_MS) {
-        return;
-      }
-
-      resetRtc();
-    }
-
-    const forceRelay = state.forceRelay;
-    const peerConnection = new RTCPeerConnection(createRtcConfig(forceRelay));
-    state.rtc = peerConnection;
-    state.remoteStream = new MediaStream();
-    state.pendingCandidates = [];
-    state.rtcStartedAt = Date.now();
-
-    peerConnection.addTransceiver("video", { direction: "recvonly" });
-    peerConnection.addTransceiver("audio", { direction: "recvonly" });
-
-    startConnectTimeout(peerConnection);
-
-    peerConnection.addEventListener("icecandidate", (event) => {
-      if (event.candidate) {
-        send({ type: "ice", payload: event.candidate });
-      }
-    });
-
-    peerConnection.addEventListener("track", (event) => {
-      if (state.rtc !== peerConnection) {
-        return;
-      }
-
-      if (!state.remoteStream.getTracks().includes(event.track)) {
-        state.remoteStream.addTrack(event.track);
-      }
-
-      video.srcObject = state.remoteStream;
-      state.hasAudio = state.remoteStream.getAudioTracks().length > 0;
-      state.isLive = true;
-      clearConnectTimeout();
-      emptyState.hidden = true;
-      video.classList.add("is-live");
-      setStatus("Live");
-      updateMuteButton();
-      video.play().catch(() => setStatus("Bereit"));
-    });
-
-    peerConnection.addEventListener("connectionstatechange", () => {
-      if (state.rtc !== peerConnection) {
-        return;
-      }
-
-      if (peerConnection.connectionState === "connected") {
-        clearConnectTimeout();
-        setStatus("Live");
-      }
-
-      if (["failed", "closed", "disconnected"].includes(peerConnection.connectionState)) {
-        resetRtc();
-
-        if (state.senderOnline && state.wantsLive) {
-          state.forceRelay = true;
-          setStatus("Verbinde ueber Relay");
-          requestOffer();
-        }
-      }
-    });
-
-    peerConnection.addEventListener("iceconnectionstatechange", () => {
-      if (state.rtc !== peerConnection || state.isLive) {
-        return;
-      }
-
-      if (peerConnection.iceConnectionState === "checking") {
-        setStatus(forceRelay ? "Relay wird geprueft" : "Verbindung wird geprueft");
-      }
-
-      if (peerConnection.iceConnectionState === "connected" || peerConnection.iceConnectionState === "completed") {
-        clearConnectTimeout();
-        setStatus("Live");
-      }
-
-      if (peerConnection.iceConnectionState === "failed") {
-        resetRtc();
-        state.forceRelay = true;
-        setStatus("Verbinde ueber Relay");
-        requestOffer();
-      }
-    });
-
-    try {
-      const offer = await peerConnection.createOffer();
-      await peerConnection.setLocalDescription(offer);
-      send({
-        type: "offer",
-        payload: {
-          description: peerConnection.localDescription,
-          forceRelay
-        }
-      });
-    } catch {
-      resetRtc();
-      setStatus("Verbindung fehlgeschlagen");
     }
   }
 
-  async function handleAnswer(answer) {
-    if (!state.rtc || !answer) {
+  function handleMediaStart(message) {
+    state.senderOnline = true;
+    state.mimeType = selectPlayableMimeType(message.mimeType);
+
+    if (!state.mimeType) {
+      resetMedia();
+      setEmpty("Streamformat nicht unterstuetzt");
+      setStatus("Browser nicht kompatibel");
       return;
     }
 
-    try {
-      await state.rtc.setRemoteDescription(answer);
-
-      for (const candidate of state.pendingCandidates.splice(0)) {
-        await state.rtc.addIceCandidate(candidate).catch(() => {});
-      }
-    } catch {
-      resetRtc();
-      setStatus("Verbindung fehlgeschlagen");
-    }
-  }
-
-  async function addRemoteCandidate(candidate) {
-    if (!candidate || !state.rtc) {
-      return;
-    }
-
-    if (!state.rtc.remoteDescription) {
-      state.pendingCandidates.push(candidate);
-      return;
-    }
-
-    await state.rtc.addIceCandidate(candidate).catch(() => {});
-  }
-
-  function resetRtc() {
-    clearConnectTimeout();
-
-    if (state.rtc) {
-      state.rtc.close();
-    }
-
-    state.rtc = null;
-    state.remoteStream = null;
-    state.pendingCandidates = [];
-    state.rtcStartedAt = 0;
-    state.hasAudio = false;
-    state.isLive = false;
-    video.srcObject = null;
-    video.classList.remove("is-live");
-    emptyState.hidden = false;
+    resetMedia();
+    state.mimeType = selectPlayableMimeType(message.mimeType);
+    state.isLive = true;
+    emptyState.hidden = true;
+    video.classList.add("is-live");
+    setStatus("Puffer wird geladen");
+    setupMediaSource();
     updateMuteButton();
   }
 
-  function startConnectTimeout(peerConnection) {
-    clearConnectTimeout();
-    state.connectTimer = window.setTimeout(() => {
-      if (state.rtc !== peerConnection || state.isLive) {
+  function handleMediaStop(message) {
+    resetMedia();
+    state.senderOnline = Boolean(message.online);
+    setEmpty(state.senderOnline ? "Stream beendet" : "Sender wird gesucht");
+    setStatus(state.senderOnline ? "Stream beendet" : "Sender offline");
+  }
+
+  function setupMediaSource() {
+    const mediaSource = new MediaSource();
+    state.mediaSource = mediaSource;
+    state.objectUrl = URL.createObjectURL(mediaSource);
+    video.src = state.objectUrl;
+    video.muted = state.muted;
+
+    mediaSource.addEventListener("sourceopen", () => {
+      if (state.mediaSource !== mediaSource || mediaSource.readyState !== "open") {
         return;
       }
 
-      resetRtc();
-      state.forceRelay = true;
-      setStatus("Verbinde ueber Relay");
-      requestOffer();
-    }, CONNECT_TIMEOUT_MS);
+      try {
+        state.sourceBuffer = mediaSource.addSourceBuffer(state.mimeType);
+        state.sourceBuffer.mode = "sequence";
+        state.sourceBuffer.addEventListener("updateend", onSourceBufferUpdateEnd);
+        appendNextChunk();
+      } catch {
+        resetMedia();
+        setEmpty("Streamformat nicht unterstuetzt");
+        setStatus("Browser nicht kompatibel");
+      }
+    });
   }
 
-  function clearConnectTimeout() {
-    if (state.connectTimer) {
-      window.clearTimeout(state.connectTimer);
-      state.connectTimer = null;
+  function onSourceBufferUpdateEnd() {
+    trimBuffer();
+    appendNextChunk();
+  }
+
+  function handleMediaChunk(data) {
+    if (!state.isLive || !data || !data.byteLength) {
+      return;
     }
+
+    state.queue.push(data);
+    appendNextChunk();
+  }
+
+  function appendNextChunk() {
+    if (!state.sourceBuffer || state.sourceBuffer.updating || state.queue.length === 0) {
+      return;
+    }
+
+    if (!state.mediaSource || state.mediaSource.readyState !== "open") {
+      return;
+    }
+
+    const chunk = state.queue.shift();
+
+    try {
+      state.sourceBuffer.appendBuffer(chunk);
+
+      if (video.paused) {
+        video.play().catch(() => {});
+      }
+
+      if (!emptyState.hidden) {
+        emptyState.hidden = true;
+      }
+
+      setStatus("Live");
+    } catch {
+      resetMedia();
+      setEmpty("Stream unterbrochen");
+      setStatus("Stream unterbrochen");
+    }
+  }
+
+  function trimBuffer() {
+    if (!state.sourceBuffer || state.sourceBuffer.updating || video.currentTime < MAX_BUFFER_SECONDS) {
+      return;
+    }
+
+    try {
+      const removeEnd = video.currentTime - MAX_BUFFER_SECONDS;
+
+      if (removeEnd > 0 && state.sourceBuffer.buffered.length > 0 && state.sourceBuffer.buffered.start(0) < removeEnd) {
+        state.sourceBuffer.remove(0, removeEnd);
+      }
+    } catch {
+      // Buffer trimming is opportunistic; playback can continue without it.
+    }
+  }
+
+  function resetMedia() {
+    state.queue = [];
+    state.isLive = false;
+
+    if (state.sourceBuffer) {
+      state.sourceBuffer.removeEventListener("updateend", onSourceBufferUpdateEnd);
+    }
+
+    if (state.mediaSource && state.mediaSource.readyState === "open") {
+      try {
+        state.mediaSource.endOfStream();
+      } catch {
+        // The media source can already be closing.
+      }
+    }
+
+    state.mediaSource = null;
+    state.sourceBuffer = null;
+
+    if (state.objectUrl) {
+      URL.revokeObjectURL(state.objectUrl);
+      state.objectUrl = "";
+    }
+
+    video.removeAttribute("src");
+    video.load();
+    video.classList.remove("is-live");
+    emptyState.hidden = false;
+    updateMuteButton();
   }
 
   function scheduleReconnect() {
@@ -365,24 +275,14 @@
   }
 
   function send(message) {
-    if (isSocketOpen()) {
+    if (state.socket && state.socket.readyState === WebSocket.OPEN) {
       state.socket.send(JSON.stringify(message));
     }
   }
 
-  function isSocketOpen() {
-    return state.socket && state.socket.readyState === WebSocket.OPEN;
-  }
-
   function startReadyLoop() {
     stopReadyLoop();
-    state.readyTimer = window.setInterval(() => {
-      sendReady();
-
-      if (state.senderOnline && state.wantsLive && !state.isLive) {
-        requestOffer();
-      }
-    }, READY_MS);
+    state.readyTimer = window.setInterval(sendReady, READY_MS);
   }
 
   function stopReadyLoop() {
@@ -401,7 +301,7 @@
 
   function updateMuteButton() {
     video.muted = state.muted;
-    muteButton.disabled = state.isLive && !state.hasAudio;
+    muteButton.disabled = false;
     muteButton.setAttribute("aria-pressed", String(state.muted));
 
     if (state.muted) {
@@ -420,21 +320,25 @@
     volumeOffIcon.hidden = true;
   }
 
-  function getSocketUrl(role) {
+  function selectPlayableMimeType(preferredMimeType) {
+    const candidates = [
+      preferredMimeType,
+      "video/webm;codecs=vp8,opus",
+      "video/webm;codecs=vp9,opus",
+      "video/webm"
+    ].filter(Boolean);
+
+    return candidates.find((mimeType) => MediaSource.isTypeSupported(mimeType)) || "";
+  }
+
+  function getSocketUrl() {
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
     const params = new URLSearchParams({
-      role,
+      role: "viewer",
       room: ROOM_ID
     });
 
     return `${protocol}//${window.location.host}/ws?${params.toString()}`;
-  }
-
-  function createRtcConfig(forceRelay) {
-    return {
-      iceServers: ICE_SERVERS,
-      iceTransportPolicy: forceRelay ? "relay" : "all"
-    };
   }
 
   function setStatus(text) {

@@ -1,6 +1,6 @@
 # Screen Stream Site
 
-Eine kleine Web-App fuer Live-Bildschirmstreaming mit eigenem Node/WebSocket-Signaling.
+Eine kleine Web-App fuer Live-Bildschirmstreaming mit eigenem Node/WebSocket-Relay.
 
 ## Start
 
@@ -25,6 +25,6 @@ Nach dem Deploy:
 
 ## Wichtig
 
-Der Server vermittelt nur die WebRTC-Verbindung. Der eigentliche Bildschirmstream laeuft per WebRTC direkt zwischen Sender und Zuschauern oder ueber TURN, wenn direkte Verbindung nicht moeglich ist.
+Der Sender nimmt den Bildschirm im Browser mit `MediaRecorder` auf und schickt kleine WebM-Chunks ueber WebSocket an den Server. Der Server verteilt diese Chunks an alle Zuschauer. Dadurch funktioniert der Stream ueber normale HTTPS/WSS-Verbindungen, mit etwas mehr Verzoegerung als WebRTC.
 
 Der Standard-Sender-Key kann ueber die Render-Umgebungsvariable `SENDER_KEY` geaendert werden.

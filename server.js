@@ -7,7 +7,7 @@ const { WebSocket, WebSocketServer } = require("ws");
 const PORT = Number(process.env.PORT || 3000);
 const SENDER_KEY = process.env.SENDER_KEY || "sender-123a88d8f2b64f31";
 const PUBLIC_DIR = __dirname;
-const MAX_MESSAGE_BYTES = 1024 * 1024;
+const MAX_MESSAGE_BYTES = 8 * 1024 * 1024;
 
 const MIME_TYPES = new Map([
   [".css", "text/css; charset=utf-8"],
@@ -97,6 +97,12 @@ function handleHttp(req, res) {
     return;
   }
 
+  if (req.method === "GET" && url.pathname === "/favicon.ico") {
+    res.writeHead(204, { "Cache-Control": "public, max-age=86400" });
+    res.end();
+    return;
+  }
+
   if (req.method !== "GET" && req.method !== "HEAD") {
     sendJson(res, 405, { ok: false, error: "Method not allowed" });
     return;
@@ -119,6 +125,8 @@ function registerSender(ws, room, key) {
 
   room.sender = ws;
   room.live = false;
+  room.mimeType = "";
+  room.initChunk = null;
 
   send(ws, {
     type: "welcome",
@@ -129,45 +137,41 @@ function registerSender(ws, room, key) {
   });
 
   broadcastToViewers(room, {
-    type: "stream-state",
+    type: "sender-state",
     online: true,
     live: room.live
   });
 
-  ws.on("message", (raw) => {
+  ws.on("message", (raw, isBinary) => {
+    if (isBinary) {
+      handleMediaChunk(room, raw);
+      return;
+    }
+
     const message = parseMessage(raw);
 
-    if (message.type === "stream-state") {
-      room.live = Boolean(message.payload && message.payload.live);
+    if (message.type === "media-start") {
+      room.live = true;
+      room.mimeType = typeof message.mimeType === "string" ? message.mimeType : "";
+      room.initChunk = null;
       broadcastToViewers(room, {
-        type: "stream-state",
+        type: "media-start",
         online: true,
-        live: room.live
+        live: true,
+        mimeType: room.mimeType
       });
       return;
     }
 
-    if (message.type === "answer" || message.type === "ice") {
-      const viewer = room.viewers.get(message.viewerId);
-
-      if (viewer) {
-        send(viewer, {
-          type: message.type,
-          payload: message.payload || null
-        });
-      }
+    if (message.type === "media-stop") {
+      stopRoomStream(room, true);
     }
   });
 
   ws.on("close", () => {
     if (room.sender === ws) {
       room.sender = null;
-      room.live = false;
-      broadcastToViewers(room, {
-        type: "stream-state",
-        online: false,
-        live: false
-      });
+      stopRoomStream(room, false);
       cleanupRoom(room);
     }
   });
@@ -185,10 +189,23 @@ function registerViewer(ws, room) {
   });
 
   send(ws, {
-    type: "stream-state",
+    type: "sender-state",
     online: Boolean(room.sender),
     live: room.live
   });
+
+  if (room.sender && room.live && room.mimeType) {
+    send(ws, {
+      type: "media-start",
+      online: true,
+      live: true,
+      mimeType: room.mimeType
+    });
+
+    if (room.initChunk) {
+      sendBinary(ws, room.initChunk);
+    }
+  }
 
   if (room.sender) {
     send(room.sender, {
@@ -203,7 +220,7 @@ function registerViewer(ws, room) {
 
     if (!room.sender) {
       send(ws, {
-        type: "stream-state",
+        type: "sender-state",
         online: false,
         live: false
       });
@@ -211,18 +228,10 @@ function registerViewer(ws, room) {
     }
 
     if (message.type === "viewer-ready") {
-      send(room.sender, {
-        type: "viewer-ready",
-        viewerId
-      });
-      return;
-    }
-
-    if (message.type === "offer" || message.type === "ice") {
-      send(room.sender, {
-        type: message.type,
-        viewerId,
-        payload: message.payload || null
+      send(ws, {
+        type: "sender-state",
+        online: true,
+        live: room.live
       });
     }
   });
@@ -289,6 +298,8 @@ function getRoom(roomId) {
       id: roomId,
       sender: null,
       live: false,
+      mimeType: "",
+      initChunk: null,
       viewers: new Map()
     };
     rooms.set(roomId, room);
@@ -313,9 +324,48 @@ function broadcastToViewers(room, message) {
   }
 }
 
+function broadcastBinaryToViewers(room, chunk) {
+  for (const [viewerId, viewer] of room.viewers) {
+    if (viewer.readyState === WebSocket.OPEN) {
+      sendBinary(viewer, chunk);
+    } else {
+      room.viewers.delete(viewerId);
+    }
+  }
+}
+
+function handleMediaChunk(room, chunk) {
+  if (!room.sender || !room.live) {
+    return;
+  }
+
+  if (!room.initChunk) {
+    room.initChunk = Buffer.from(chunk);
+  }
+
+  broadcastBinaryToViewers(room, chunk);
+}
+
+function stopRoomStream(room, senderStillOnline) {
+  room.live = false;
+  room.mimeType = "";
+  room.initChunk = null;
+  broadcastToViewers(room, {
+    type: "media-stop",
+    online: senderStillOnline && Boolean(room.sender),
+    live: false
+  });
+}
+
 function send(ws, payload) {
   if (ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify(payload));
+  }
+}
+
+function sendBinary(ws, chunk) {
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(chunk, { binary: true });
   }
 }
 
