@@ -1,14 +1,6 @@
 (function () {
-  const config = window.STREAM_CONFIG || {
-    roomId: "screen-stream-4f8a9f9c8ef44d18",
-    senderKey: ""
-  };
-
-  const params = new URLSearchParams(window.location.search);
-  const senderKey = params.get("key") || "";
-  const ROOM_ID = config.roomId;
-  const SENDER_PEER_ID = `${ROOM_ID}-sender`;
-  const EXPECTED_SENDER_KEY = config.senderKey;
+  const ROOM_ID = "main";
+  const LIVE_PULSE_MS = 3000;
   const VIDEO_MAX_BITRATE = 2200000;
   const AUDIO_MAX_BITRATE = 64000;
   const ICE_SERVERS = [
@@ -32,6 +24,9 @@
     }
   ];
 
+  const params = new URLSearchParams(window.location.search);
+  const senderKey = params.get("key") || "";
+
   const startButton = document.querySelector("#startButton");
   const stopButton = document.querySelector("#stopButton");
   const senderStatus = document.querySelector("#senderStatus");
@@ -41,15 +36,17 @@
   const viewerUrl = document.querySelector("#viewerUrl");
 
   const state = {
-    peer: null,
+    socket: null,
     stream: null,
-    viewerConnections: new Map(),
+    viewers: new Set(),
     rtcPeers: new Map(),
     pendingCandidates: new Map(),
-    liveTimer: null
+    liveTimer: null,
+    reconnectTimer: null,
+    accepted: false
   };
 
-  viewerUrl.textContent = `Zuschauer-Link: ${window.location.origin}${window.location.pathname.replace(/sender\.html$/, "")}`;
+  viewerUrl.textContent = `Zuschauer-Link: ${window.location.origin}/`;
   startButton.addEventListener("click", startStream);
   stopButton.addEventListener("click", stopStream);
   window.addEventListener("beforeunload", () => {
@@ -57,100 +54,94 @@
       state.stream.getTracks().forEach((track) => track.stop());
     }
 
-    if (state.peer && !state.peer.destroyed) {
-      state.peer.destroy();
+    if (state.socket) {
+      state.socket.close();
     }
   });
 
-  if (senderKey !== EXPECTED_SENDER_KEY) {
-    setStatus("Sender-Key fehlt oder ist falsch");
+  if (!senderKey) {
+    setStatus("Sender-Key fehlt");
     startButton.disabled = true;
-    return;
+  } else {
+    connectSocket();
   }
 
-  waitForPeerLibrary().then(startSender).catch(() => {
-    setStatus("PeerJS konnte nicht geladen werden");
-  });
+  function connectSocket() {
+    clearTimeout(state.reconnectTimer);
+    closeSocket();
+    setStatus("Sender-Verbindung wird aufgebaut");
+    startButton.disabled = true;
 
-  function startSender() {
-    state.peer = new Peer(SENDER_PEER_ID, {
-      debug: 1,
-      config: { iceServers: ICE_SERVERS }
-    });
+    const socket = new WebSocket(getSocketUrl());
+    state.socket = socket;
 
-    state.peer.on("open", () => {
-      setStatus("Bereit");
-      startButton.disabled = false;
-    });
+    socket.addEventListener("message", (event) => {
+      const message = parseMessage(event.data);
 
-    state.peer.on("disconnected", () => {
-      setStatus("Sender-Verbindung wird erneuert");
-      state.peer.reconnect();
-    });
-
-    state.peer.on("close", () => {
-      setStatus("Sender offline");
-      startButton.disabled = true;
-    });
-
-    state.peer.on("connection", (connection) => {
-      const existing = state.viewerConnections.get(connection.peer);
-
-      if (existing && existing !== connection) {
-        existing.close();
+      if (message.type === "welcome") {
+        state.accepted = true;
+        state.viewers = new Set(message.viewerIds || []);
+        updateViewerCount();
+        startButton.disabled = Boolean(state.stream);
+        stopButton.disabled = !state.stream;
+        setStatus(state.stream ? "Live" : "Bereit");
+        sendStreamState(Boolean(state.stream));
       }
 
-      state.viewerConnections.set(connection.peer, connection);
-      updateViewerCount();
+      if (message.type === "error") {
+        setStatus(message.error || "Sender-Verbindung abgelehnt");
+        startButton.disabled = true;
+      }
 
-      connection.on("open", () => {
-        sendToViewer(connection.peer, { type: state.stream ? "live" : "waiting" });
-      });
+      if (message.type === "viewer-joined") {
+        state.viewers.add(message.viewerId);
+        updateViewerCount();
+        sendStreamState(Boolean(state.stream));
+      }
 
-      connection.on("data", (message) => {
-        if (!message || typeof message !== "object") {
-          return;
-        }
+      if (message.type === "viewer-left") {
+        state.viewers.delete(message.viewerId);
+        closeViewerRtc(message.viewerId);
+        state.pendingCandidates.delete(message.viewerId);
+        updateViewerCount();
+      }
 
-        if (message.type === "viewer-ready") {
-          sendToViewer(connection.peer, { type: state.stream ? "live" : "waiting" });
-        }
+      if (message.type === "viewer-ready") {
+        sendStreamState(Boolean(state.stream));
+      }
 
-        if (message.type === "viewer-offer") {
-          handleViewerOffer(connection.peer, message.payload);
-        }
+      if (message.type === "offer") {
+        handleViewerOffer(message.viewerId, message.payload);
+      }
 
-        if (message.type === "viewer-ice") {
-          addRemoteCandidate(connection.peer, message.payload);
-        }
-      });
-
-      connection.on("close", () => {
-        if (state.viewerConnections.get(connection.peer) === connection) {
-          state.viewerConnections.delete(connection.peer);
-          closeViewerRtc(connection.peer);
-          state.pendingCandidates.delete(connection.peer);
-          updateViewerCount();
-        }
-      });
-
-      connection.on("error", () => {
-        if (state.viewerConnections.get(connection.peer) === connection) {
-          state.viewerConnections.delete(connection.peer);
-          closeViewerRtc(connection.peer);
-          state.pendingCandidates.delete(connection.peer);
-          updateViewerCount();
-        }
-      });
+      if (message.type === "ice") {
+        addRemoteCandidate(message.viewerId, message.payload);
+      }
     });
 
-    state.peer.on("error", (error) => {
-      if (error && error.type === "unavailable-id") {
-        setStatus("Sender ist bereits offen");
+    socket.addEventListener("close", () => {
+      if (state.socket !== socket) {
         return;
       }
 
-      setStatus("Sender-Verbindung gestoert");
+      state.socket = null;
+      state.accepted = false;
+      stopLivePulse();
+
+      if (state.stream) {
+        setStatus("Sender-Verbindung wird erneuert");
+        scheduleReconnect();
+        return;
+      }
+
+      setStatus("Sender offline");
+      scheduleReconnect();
+    });
+
+    socket.addEventListener("error", () => {
+      if (!state.accepted) {
+        setStatus("Sender-Verbindung gestoert");
+      }
     });
   }
 
@@ -185,7 +176,7 @@
       track.addEventListener("ended", stopStream, { once: true });
     });
 
-    broadcast({ type: "live" });
+    sendStreamState(true);
     startLivePulse();
   }
 
@@ -198,7 +189,7 @@
     state.stream = null;
     previewVideo.srcObject = null;
     previewEmpty.hidden = false;
-    startButton.disabled = false;
+    startButton.disabled = !state.accepted;
     stopButton.disabled = true;
 
     for (const viewerId of Array.from(state.rtcPeers.keys())) {
@@ -207,13 +198,13 @@
 
     state.pendingCandidates.clear();
     stopLivePulse();
-    broadcast({ type: "waiting" });
-    setStatus("Bereit");
+    sendStreamState(false);
+    setStatus(state.accepted ? "Bereit" : "Sender offline");
   }
 
   async function handleViewerOffer(viewerId, offer) {
-    if (!state.stream) {
-      sendToViewer(viewerId, { type: "waiting" });
+    if (!state.stream || !viewerId) {
+      sendStreamState(false);
       return;
     }
 
@@ -233,25 +224,22 @@
 
     applyPeerLimits(peerConnection);
 
-    peerConnection.onicecandidate = (event) => {
+    peerConnection.addEventListener("icecandidate", (event) => {
       if (event.candidate) {
-        sendToViewer(viewerId, { type: "sender-ice", payload: event.candidate });
+        send({ type: "ice", viewerId, payload: event.candidate });
       }
-    };
+    });
 
-    peerConnection.onconnectionstatechange = () => {
+    peerConnection.addEventListener("connectionstatechange", () => {
       if (state.rtcPeers.get(viewerId) !== peerConnection) {
         return;
       }
 
       if (["failed", "closed", "disconnected"].includes(peerConnection.connectionState)) {
         closeViewerRtc(viewerId);
-
-        if (state.stream && state.viewerConnections.has(viewerId)) {
-          window.setTimeout(() => sendToViewer(viewerId, { type: "live" }), 1000);
-        }
+        sendStreamState(Boolean(state.stream));
       }
-    };
+    });
 
     try {
       await peerConnection.setRemoteDescription(offer);
@@ -259,15 +247,15 @@
 
       const answer = await peerConnection.createAnswer();
       await peerConnection.setLocalDescription(answer);
-      sendToViewer(viewerId, { type: "sender-answer", payload: peerConnection.localDescription });
+      send({ type: "answer", viewerId, payload: peerConnection.localDescription });
     } catch {
       closeViewerRtc(viewerId);
-      sendToViewer(viewerId, { type: "live" });
+      sendStreamState(Boolean(state.stream));
     }
   }
 
   async function addRemoteCandidate(viewerId, candidate) {
-    if (!candidate) {
+    if (!candidate || !viewerId) {
       return;
     }
 
@@ -299,43 +287,42 @@
       return;
     }
 
-    peerConnection.onicecandidate = null;
-    peerConnection.onconnectionstatechange = null;
     peerConnection.close();
     state.rtcPeers.delete(viewerId);
   }
 
-  function sendToViewer(viewerId, message) {
-    const connection = state.viewerConnections.get(viewerId);
+  function sendStreamState(live) {
+    send({
+      type: "stream-state",
+      payload: { live }
+    });
+  }
 
-    if (connection && connection.open) {
-      connection.send(message);
+  function send(message) {
+    if (state.socket && state.socket.readyState === WebSocket.OPEN) {
+      state.socket.send(JSON.stringify(message));
     }
   }
 
-  function broadcast(message) {
-    for (const [viewerId, connection] of state.viewerConnections) {
-      if (connection.open) {
-        connection.send(message);
-      } else {
-        state.viewerConnections.delete(viewerId);
-        closeViewerRtc(viewerId);
-      }
+  function closeSocket() {
+    if (!state.socket) {
+      return;
     }
 
-    updateViewerCount();
+    state.socket.close();
+    state.socket = null;
+  }
+
+  function scheduleReconnect() {
+    clearTimeout(state.reconnectTimer);
+    state.reconnectTimer = setTimeout(connectSocket, 2500);
   }
 
   function startLivePulse() {
     stopLivePulse();
     state.liveTimer = window.setInterval(() => {
-      if (!state.stream) {
-        stopLivePulse();
-        return;
-      }
-
-      broadcast({ type: "live" });
-    }, 3000);
+      sendStreamState(Boolean(state.stream));
+    }, LIVE_PULSE_MS);
   }
 
   function stopLivePulse() {
@@ -385,8 +372,19 @@
     }
   }
 
+  function getSocketUrl() {
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const params = new URLSearchParams({
+      role: "sender",
+      room: ROOM_ID,
+      key: senderKey
+    });
+
+    return `${protocol}//${window.location.host}/ws?${params.toString()}`;
+  }
+
   function updateViewerCount() {
-    const count = state.viewerConnections.size;
+    const count = state.viewers.size;
     viewerCount.textContent = count === 1 ? "1 Zuschauer" : `${count} Zuschauer`;
   }
 
@@ -394,25 +392,11 @@
     senderStatus.textContent = text;
   }
 
-  function waitForPeerLibrary() {
-    return new Promise((resolve, reject) => {
-      const startedAt = Date.now();
-
-      const check = () => {
-        if (window.Peer) {
-          resolve();
-          return;
-        }
-
-        if (Date.now() - startedAt > 8000) {
-          reject(new Error("PeerJS timed out"));
-          return;
-        }
-
-        window.setTimeout(check, 50);
-      };
-
-      check();
-    });
+  function parseMessage(raw) {
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return {};
+    }
   }
 })();

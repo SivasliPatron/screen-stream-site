@@ -1,11 +1,5 @@
 (function () {
-  const config = window.STREAM_CONFIG || {
-    roomId: "screen-stream-4f8a9f9c8ef44d18",
-    senderKey: ""
-  };
-
-  const ROOM_ID = config.roomId;
-  const SENDER_PEER_ID = `${ROOM_ID}-sender`;
+  const ROOM_ID = "main";
   const RETRY_MS = 2500;
   const READY_MS = 3000;
   const OFFER_RETRY_MS = 9000;
@@ -40,8 +34,8 @@
   const volumeOffIcon = document.querySelector("#volumeOffIcon");
 
   const state = {
-    peer: null,
-    controlConnection: null,
+    socket: null,
+    viewerId: "",
     rtc: null,
     remoteStream: null,
     pendingCandidates: [],
@@ -52,7 +46,8 @@
     muted: true,
     hasAudio: false,
     isLive: false,
-    wantsLive: false
+    wantsLive: false,
+    senderOnline: false
   };
 
   video.controls = false;
@@ -60,121 +55,89 @@
   video.addEventListener("contextmenu", (event) => event.preventDefault());
   muteButton.addEventListener("click", toggleMute);
   window.addEventListener("beforeunload", () => {
-    if (state.peer && !state.peer.destroyed) {
-      state.peer.destroy();
+    if (state.socket) {
+      state.socket.close();
     }
   });
 
-  waitForPeerLibrary().then(startViewer).catch(() => {
-    setEmpty("Verbindung nicht moeglich");
-    setStatus("PeerJS konnte nicht geladen werden");
-  });
+  connectSocket();
+  updateMuteButton();
 
-  function startViewer() {
-    state.peer = new Peer(undefined, {
-      debug: 1,
-      config: { iceServers: ICE_SERVERS }
-    });
-
-    state.peer.on("open", () => {
-      setStatus("Suche Stream");
-      connectToSender();
-    });
-
-    state.peer.on("disconnected", () => {
-      setStatus("Verbindung wird erneuert");
-      state.peer.reconnect();
-    });
-
-    state.peer.on("error", () => {
-      setStatus("Sender wird gesucht");
-      scheduleReconnect();
-    });
-
-    updateMuteButton();
-  }
-
-  function connectToSender() {
+  function connectSocket() {
     clearTimeout(state.reconnectTimer);
+    closeSocket();
+    setStatus("Verbindung wird aufgebaut");
 
-    if (!state.peer || state.peer.disconnected || state.peer.destroyed) {
-      scheduleReconnect();
-      return;
-    }
+    const socket = new WebSocket(getSocketUrl("viewer"));
+    state.socket = socket;
 
-    closeControlConnection();
-
-    const connection = state.peer.connect(SENDER_PEER_ID, {
-      reliable: true,
-      metadata: { role: "viewer" }
-    });
-
-    state.controlConnection = connection;
-
-    connection.on("open", () => {
-      setStatus("Sender verbunden");
-      setEmpty("Warte auf Stream");
+    socket.addEventListener("open", () => {
+      setStatus("Sender wird gesucht");
+      setEmpty("Sender wird gesucht");
       sendReady();
       startReadyLoop();
     });
 
-    connection.on("data", (message) => {
-      if (!message || typeof message !== "object") {
-        return;
+    socket.addEventListener("message", (event) => {
+      const message = parseMessage(event.data);
+
+      if (message.type === "welcome") {
+        state.viewerId = message.viewerId || "";
       }
 
-      if (message.type === "waiting") {
-        state.wantsLive = false;
-        resetRtc();
-        setEmpty("Warte auf Stream");
-        setStatus("Sender verbunden");
+      if (message.type === "stream-state") {
+        handleStreamState(message);
       }
 
-      if (message.type === "offline") {
-        state.wantsLive = false;
-        resetRtc();
-        setEmpty("Sender wird gesucht");
-        setStatus("Sender offline");
-      }
-
-      if (message.type === "live") {
-        state.wantsLive = true;
-        setStatus("Verbinde");
-        requestOffer();
-      }
-
-      if (message.type === "sender-answer") {
+      if (message.type === "answer") {
         handleAnswer(message.payload);
       }
 
-      if (message.type === "sender-ice") {
+      if (message.type === "ice") {
         addRemoteCandidate(message.payload);
       }
     });
 
-    connection.on("close", () => {
-      if (state.controlConnection !== connection) {
+    socket.addEventListener("close", () => {
+      if (state.socket !== socket) {
         return;
       }
 
-      state.controlConnection = null;
       stopReadyLoop();
+      resetRtc();
+      state.socket = null;
+      state.senderOnline = false;
       state.wantsLive = false;
+      setEmpty("Sender wird gesucht");
+      setStatus("Verbindung getrennt");
+      scheduleReconnect();
+    });
+
+    socket.addEventListener("error", () => {
+      setStatus("Verbindung gestoert");
+    });
+  }
+
+  function handleStreamState(message) {
+    state.senderOnline = Boolean(message.online);
+    state.wantsLive = Boolean(message.live);
+
+    if (!state.senderOnline) {
       resetRtc();
       setEmpty("Sender wird gesucht");
       setStatus("Sender offline");
-      scheduleReconnect();
-    });
+      return;
+    }
 
-    connection.on("error", () => {
-      if (state.controlConnection !== connection) {
-        return;
-      }
+    if (!state.wantsLive) {
+      resetRtc();
+      setEmpty("Warte auf Stream");
+      setStatus("Sender verbunden");
+      return;
+    }
 
-      stopReadyLoop();
-      setStatus("Sender offline");
-      scheduleReconnect();
-    });
+    setStatus("Verbinde");
+    requestOffer();
   }
 
   function requestOffer() {
@@ -189,7 +152,7 @@
   }
 
   async function createOffer() {
-    if (!state.controlConnection || !state.controlConnection.open || !state.peer || !state.peer.id) {
+    if (!isSocketOpen()) {
       return;
     }
 
@@ -210,13 +173,13 @@
     peerConnection.addTransceiver("video", { direction: "recvonly" });
     peerConnection.addTransceiver("audio", { direction: "recvonly" });
 
-    peerConnection.onicecandidate = (event) => {
+    peerConnection.addEventListener("icecandidate", (event) => {
       if (event.candidate) {
-        sendControl({ type: "viewer-ice", payload: event.candidate });
+        send({ type: "ice", payload: event.candidate });
       }
-    };
+    });
 
-    peerConnection.ontrack = (event) => {
+    peerConnection.addEventListener("track", (event) => {
       if (state.rtc !== peerConnection) {
         return;
       }
@@ -233,9 +196,9 @@
       setStatus("Live");
       updateMuteButton();
       video.play().catch(() => setStatus("Bereit"));
-    };
+    });
 
-    peerConnection.onconnectionstatechange = () => {
+    peerConnection.addEventListener("connectionstatechange", () => {
       if (state.rtc !== peerConnection) {
         return;
       }
@@ -243,17 +206,17 @@
       if (["failed", "closed", "disconnected"].includes(peerConnection.connectionState)) {
         resetRtc();
 
-        if (state.wantsLive) {
+        if (state.senderOnline && state.wantsLive) {
           setStatus("Verbinde neu");
           requestOffer();
         }
       }
-    };
+    });
 
     try {
       const offer = await peerConnection.createOffer();
       await peerConnection.setLocalDescription(offer);
-      sendControl({ type: "viewer-offer", payload: peerConnection.localDescription });
+      send({ type: "offer", payload: peerConnection.localDescription });
     } catch {
       resetRtc();
       setStatus("Verbindung fehlgeschlagen");
@@ -292,9 +255,6 @@
 
   function resetRtc() {
     if (state.rtc) {
-      state.rtc.onicecandidate = null;
-      state.rtc.ontrack = null;
-      state.rtc.onconnectionstatechange = null;
       state.rtc.close();
     }
 
@@ -312,27 +272,31 @@
 
   function scheduleReconnect() {
     clearTimeout(state.reconnectTimer);
-    state.reconnectTimer = setTimeout(connectToSender, RETRY_MS);
+    state.reconnectTimer = setTimeout(connectSocket, RETRY_MS);
   }
 
-  function closeControlConnection() {
-    if (!state.controlConnection) {
+  function closeSocket() {
+    if (!state.socket) {
       return;
     }
 
     stopReadyLoop();
-    state.controlConnection.close();
-    state.controlConnection = null;
+    state.socket.close();
+    state.socket = null;
   }
 
   function sendReady() {
-    sendControl({ type: "viewer-ready", viewerId: state.peer && state.peer.id });
+    send({ type: "viewer-ready" });
   }
 
-  function sendControl(message) {
-    if (state.controlConnection && state.controlConnection.open) {
-      state.controlConnection.send(message);
+  function send(message) {
+    if (isSocketOpen()) {
+      state.socket.send(JSON.stringify(message));
     }
+  }
+
+  function isSocketOpen() {
+    return state.socket && state.socket.readyState === WebSocket.OPEN;
   }
 
   function startReadyLoop() {
@@ -340,7 +304,7 @@
     state.readyTimer = window.setInterval(() => {
       sendReady();
 
-      if (state.wantsLive && !state.isLive) {
+      if (state.senderOnline && state.wantsLive && !state.isLive) {
         requestOffer();
       }
     }, READY_MS);
@@ -381,6 +345,16 @@
     volumeOffIcon.hidden = true;
   }
 
+  function getSocketUrl(role) {
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const params = new URLSearchParams({
+      role,
+      room: ROOM_ID
+    });
+
+    return `${protocol}//${window.location.host}/ws?${params.toString()}`;
+  }
+
   function setStatus(text) {
     statusText.textContent = text;
   }
@@ -390,25 +364,11 @@
     emptyState.hidden = false;
   }
 
-  function waitForPeerLibrary() {
-    return new Promise((resolve, reject) => {
-      const startedAt = Date.now();
-
-      const check = () => {
-        if (window.Peer) {
-          resolve();
-          return;
-        }
-
-        if (Date.now() - startedAt > 8000) {
-          reject(new Error("PeerJS timed out"));
-          return;
-        }
-
-        window.setTimeout(check, 50);
-      };
-
-      check();
-    });
+  function parseMessage(raw) {
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return {};
+    }
   }
 })();

@@ -1,15 +1,30 @@
-# GitHub Pages Screen Stream
+# Screen Stream Site
 
-Diese Version laeuft ohne eigenen Node-Server auf GitHub Pages.
+Eine kleine Web-App fuer Live-Bildschirmstreaming mit eigenem Node/WebSocket-Signaling.
 
-## Dateien
+## Start
 
-- `index.html` ist der Zuschauer-Link.
-- `sender.html?key=sender-123a88d8f2b64f31` ist dein Sender-Link.
-- `config.js` enthaelt die Room-ID.
+```powershell
+npm install
+npm start
+```
+
+Danach:
+
+- Zuschauer: `http://localhost:3000/`
+- Sender: `http://localhost:3000/sender?key=sender-123a88d8f2b64f31`
+
+## Render
+
+Das Repo enthaelt `render.yaml` fuer einen Render Web Service.
+
+Nach dem Deploy:
+
+- Zuschauer: `https://<render-service>.onrender.com/`
+- Sender: `https://<render-service>.onrender.com/sender?key=sender-123a88d8f2b64f31`
 
 ## Wichtig
 
-GitHub Pages kann keinen eigenen Signaling-Server starten. Diese Version nutzt deshalb PeerJS Cloud fuer die WebRTC-Verbindungsvermittlung. Der eigentliche Bildschirmstream laeuft direkt per WebRTC zwischen deinem Browser und den Zuschauern.
+Der Server vermittelt nur die WebRTC-Verbindung. Der eigentliche Bildschirmstream laeuft per WebRTC direkt zwischen Sender und Zuschauern oder ueber TURN, wenn direkte Verbindung nicht moeglich ist.
 
-GitHub Pages ist statisch. Der Sender-Key ist deshalb kein echter Passwortschutz gegen technisch versierte Personen, weil statische Dateien oeffentlich sind. Fuer echten Zugriffsschutz braucht die App einen richtigen Server.
+Der Standard-Sender-Key kann ueber die Render-Umgebungsvariable `SENDER_KEY` geaendert werden.
