@@ -52,6 +52,15 @@
   viewerUrl.textContent = `Zuschauer-Link: ${window.location.origin}${window.location.pathname.replace(/sender\.html$/, "")}`;
   startButton.addEventListener("click", startStream);
   stopButton.addEventListener("click", stopStream);
+  window.addEventListener("beforeunload", () => {
+    if (state.stream) {
+      state.stream.getTracks().forEach((track) => track.stop());
+    }
+
+    if (state.peer && !state.peer.destroyed) {
+      state.peer.destroy();
+    }
+  });
 
   if (senderKey !== EXPECTED_SENDER_KEY) {
     setStatus("Sender-Key fehlt oder ist falsch");
@@ -72,6 +81,16 @@
     state.peer.on("open", () => {
       setStatus("Bereit");
       startButton.disabled = false;
+    });
+
+    state.peer.on("disconnected", () => {
+      setStatus("Sender-Verbindung wird erneuert");
+      state.peer.reconnect();
+    });
+
+    state.peer.on("close", () => {
+      setStatus("Sender offline");
+      startButton.disabled = true;
     });
 
     state.peer.on("connection", (connection) => {

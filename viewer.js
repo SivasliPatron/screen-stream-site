@@ -59,6 +59,11 @@
   video.muted = state.muted;
   video.addEventListener("contextmenu", (event) => event.preventDefault());
   muteButton.addEventListener("click", toggleMute);
+  window.addEventListener("beforeunload", () => {
+    if (state.peer && !state.peer.destroyed) {
+      state.peer.destroy();
+    }
+  });
 
   waitForPeerLibrary().then(startViewer).catch(() => {
     setEmpty("Verbindung nicht moeglich");
