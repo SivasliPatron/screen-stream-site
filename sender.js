@@ -4,6 +4,11 @@
   const VIDEO_BITS_PER_SECOND = 2200000;
   const AUDIO_BITS_PER_SECOND = 64000;
   const MIME_TYPE_CANDIDATES = [
+    "video/mp4;codecs=avc1.42E01E,mp4a.40.2",
+    "video/mp4;codecs=avc1.4D401E,mp4a.40.2",
+    "video/mp4;codecs=avc1.64001F,mp4a.40.2",
+    "video/mp4;codecs=h264,aac",
+    "video/mp4",
     "video/webm;codecs=vp8,opus",
     "video/webm;codecs=vp9,opus",
     "video/webm"
@@ -185,17 +190,15 @@
   }
 
   function startRecorder() {
-    try {
-      state.recorder = new MediaRecorder(state.stream, {
-        mimeType: state.mimeType,
-        videoBitsPerSecond: VIDEO_BITS_PER_SECOND,
-        audioBitsPerSecond: AUDIO_BITS_PER_SECOND
-      });
-    } catch {
+    state.recorder = createRecorder();
+
+    if (!state.recorder) {
       setStatus("Aufnahme konnte nicht gestartet werden");
       stopStream();
       return;
     }
+
+    state.mimeType = state.recorder.mimeType || state.mimeType;
 
     state.recorder.addEventListener("dataavailable", (event) => {
       if (!event.data || event.data.size === 0) {
@@ -278,6 +281,36 @@
 
   function chooseRecorderMimeType() {
     return MIME_TYPE_CANDIDATES.find((mimeType) => MediaRecorder.isTypeSupported(mimeType)) || "";
+  }
+
+  function createRecorder() {
+    const candidates = unique([state.mimeType].concat(MIME_TYPE_CANDIDATES))
+      .filter((mimeType) => MediaRecorder.isTypeSupported(mimeType));
+
+    for (const mimeType of candidates) {
+      try {
+        return new MediaRecorder(state.stream, {
+          mimeType,
+          videoBitsPerSecond: VIDEO_BITS_PER_SECOND,
+          audioBitsPerSecond: AUDIO_BITS_PER_SECOND
+        });
+      } catch {
+        // Try the next container/codec variant.
+      }
+    }
+
+    try {
+      return new MediaRecorder(state.stream, {
+        videoBitsPerSecond: VIDEO_BITS_PER_SECOND,
+        audioBitsPerSecond: AUDIO_BITS_PER_SECOND
+      });
+    } catch {
+      return null;
+    }
+  }
+
+  function unique(values) {
+    return Array.from(new Set(values.filter(Boolean)));
   }
 
   function tuneCaptureTracks() {

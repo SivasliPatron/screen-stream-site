@@ -28,6 +28,8 @@
   };
 
   video.controls = false;
+  video.disableRemotePlayback = true;
+  video.setAttribute("disableRemotePlayback", "");
   video.muted = state.muted;
   video.addEventListener("contextmenu", (event) => event.preventDefault());
   muteButton.addEventListener("click", toggleMute);
@@ -113,17 +115,17 @@
 
   function handleMediaStart(message) {
     state.senderOnline = true;
-    state.mimeType = selectPlayableMimeType(message.mimeType);
+    const playableMimeType = selectPlayableMimeType(message.mimeType);
 
-    if (!state.mimeType) {
+    if (!playableMimeType) {
       resetMedia();
-      setEmpty("Streamformat nicht unterstuetzt");
-      setStatus("Browser nicht kompatibel");
+      setEmpty(getUnsupportedTitle(message.mimeType));
+      setStatus(getUnsupportedStatus(message.mimeType));
       return;
     }
 
     resetMedia();
-    state.mimeType = selectPlayableMimeType(message.mimeType);
+    state.mimeType = playableMimeType;
     state.isLive = true;
     emptyState.hidden = true;
     video.classList.add("is-live");
@@ -140,7 +142,16 @@
   }
 
   function setupMediaSource() {
-    const mediaSource = new MediaSource();
+    const MediaSourceApi = getMediaSourceApi();
+
+    if (!MediaSourceApi) {
+      resetMedia();
+      setEmpty("Browser nicht kompatibel");
+      setStatus("MediaSource fehlt");
+      return;
+    }
+
+    const mediaSource = new MediaSourceApi();
     state.mediaSource = mediaSource;
     state.objectUrl = URL.createObjectURL(mediaSource);
     video.src = state.objectUrl;
@@ -321,14 +332,78 @@
   }
 
   function selectPlayableMimeType(preferredMimeType) {
-    const candidates = [
-      preferredMimeType,
-      "video/webm;codecs=vp8,opus",
-      "video/webm;codecs=vp9,opus",
-      "video/webm"
-    ].filter(Boolean);
+    const normalized = String(preferredMimeType || "").toLowerCase();
+    const candidates = [];
 
-    return candidates.find((mimeType) => MediaSource.isTypeSupported(mimeType)) || "";
+    if (normalized.includes("mp4")) {
+      candidates.push(
+        preferredMimeType,
+        "video/mp4;codecs=avc1.42E01E,mp4a.40.2",
+        "video/mp4;codecs=avc1.4D401E,mp4a.40.2",
+        "video/mp4;codecs=avc1.64001F,mp4a.40.2",
+        "video/mp4;codecs=h264,aac",
+        "video/mp4"
+      );
+    } else if (normalized.includes("webm")) {
+      candidates.push(
+        preferredMimeType,
+        "video/webm;codecs=vp8,opus",
+        "video/webm;codecs=vp9,opus",
+        "video/webm"
+      );
+    } else {
+      candidates.push(
+        preferredMimeType,
+        "video/mp4;codecs=avc1.42E01E,mp4a.40.2",
+        "video/mp4",
+        "video/webm;codecs=vp8,opus",
+        "video/webm"
+      );
+    }
+
+    return unique(candidates).find(isMimeTypeSupported) || "";
+  }
+
+  function isMimeTypeSupported(mimeType) {
+    const MediaSourceApi = getMediaSourceApi();
+    return Boolean(
+      mimeType &&
+      MediaSourceApi &&
+      typeof MediaSourceApi.isTypeSupported === "function" &&
+      MediaSourceApi.isTypeSupported(mimeType)
+    );
+  }
+
+  function getMediaSourceApi() {
+    return window.ManagedMediaSource || window.MediaSource || null;
+  }
+
+  function getUnsupportedTitle(mimeType) {
+    if (isIOS() && String(mimeType || "").toLowerCase().includes("webm")) {
+      return "iPhone braucht MP4/H.264";
+    }
+
+    return "Streamformat nicht unterstuetzt";
+  }
+
+  function getUnsupportedStatus(mimeType) {
+    if (!getMediaSourceApi()) {
+      return isIOS() ? "iOS 17.1 oder neuer benoetigt" : "MediaSource fehlt";
+    }
+
+    if (isIOS() && String(mimeType || "").toLowerCase().includes("webm")) {
+      return "Sender muss MP4/H.264 senden";
+    }
+
+    return "Browser nicht kompatibel";
+  }
+
+  function isIOS() {
+    return /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+  }
+
+  function unique(values) {
+    return Array.from(new Set(values.filter(Boolean)));
   }
 
   function getSocketUrl() {

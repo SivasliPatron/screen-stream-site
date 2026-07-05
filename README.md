@@ -25,6 +25,8 @@ Nach dem Deploy:
 
 ## Wichtig
 
-Der Sender nimmt den Bildschirm im Browser mit `MediaRecorder` auf und schickt kleine WebM-Chunks ueber WebSocket an den Server. Der Server verteilt diese Chunks an alle Zuschauer. Dadurch funktioniert der Stream ueber normale HTTPS/WSS-Verbindungen, mit etwas mehr Verzoegerung als WebRTC.
+Der Sender nimmt den Bildschirm im Browser mit `MediaRecorder` auf und schickt kleine Media-Chunks ueber WebSocket an den Server. Der Server verteilt diese Chunks an alle Zuschauer. Dadurch funktioniert der Stream ueber normale HTTPS/WSS-Verbindungen, mit etwas mehr Verzoegerung als WebRTC.
+
+Wenn der Sender-Browser es unterstuetzt, wird MP4/H.264 bevorzugt. Das ist fuer iPhone/Safari wichtig; aeltere iOS-Versionen oder ein Sender-Browser ohne MP4-Aufnahme koennen sonst nur eingeschraenkt oder gar nicht zuschauen.
 
 Der Standard-Sender-Key kann ueber die Render-Umgebungsvariable `SENDER_KEY` geaendert werden.
