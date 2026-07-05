@@ -25,7 +25,8 @@
     stream: null,
     viewerConnections: new Map(),
     calls: new Map(),
-    callTimers: new Map()
+    callTimers: new Map(),
+    liveTimer: null
   };
 
   viewerUrl.textContent = `Zuschauer-Link: ${window.location.origin}${window.location.pathname.replace(/sender\.html$/, "")}`;
@@ -131,6 +132,7 @@
     });
 
     broadcast({ type: "live" });
+    startLivePulse();
 
     for (const viewerId of state.viewerConnections.keys()) {
       requestCall(viewerId);
@@ -158,6 +160,7 @@
     }
 
     state.callTimers.clear();
+    stopLivePulse();
 
     broadcast({ type: "waiting" });
     setStatus("Bereit");
@@ -268,6 +271,29 @@
       if (connection.open) {
         connection.send(message);
       }
+    }
+  }
+
+  function startLivePulse() {
+    stopLivePulse();
+    state.liveTimer = window.setInterval(() => {
+      if (!state.stream) {
+        stopLivePulse();
+        return;
+      }
+
+      broadcast({ type: "live" });
+
+      for (const viewerId of state.viewerConnections.keys()) {
+        requestCall(viewerId);
+      }
+    }, 3000);
+  }
+
+  function stopLivePulse() {
+    if (state.liveTimer) {
+      window.clearInterval(state.liveTimer);
+      state.liveTimer = null;
     }
   }
 

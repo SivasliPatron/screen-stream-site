@@ -21,6 +21,7 @@
     peer: null,
     controlConnection: null,
     currentCall: null,
+    readyTimer: null,
     reconnectTimer: null,
     muted: true,
     hasAudio: false,
@@ -126,7 +127,8 @@
     connection.on("open", () => {
       setStatus("Sender verbunden");
       setEmpty("Warte auf Stream");
-      connection.send({ type: "viewer-ready", viewerId: state.peer.id });
+      requestLiveCall();
+      startReadyLoop();
     });
 
     connection.on("data", (message) => {
@@ -144,15 +146,18 @@
 
       if (message.type === "live") {
         setStatus("Verbinde");
+        requestLiveCall();
       }
     });
 
     connection.on("close", () => {
-      stopVideo("Stream ist offline", "Sender offline");
+      stopReadyLoop();
+      stopVideo("Sender wird gesucht", "Sender offline");
       scheduleReconnect();
     });
 
     connection.on("error", () => {
+      stopReadyLoop();
       setStatus("Sender offline");
       scheduleReconnect();
     });
@@ -168,6 +173,7 @@
       return;
     }
 
+    stopReadyLoop();
     state.controlConnection.close();
     state.controlConnection = null;
   }
@@ -224,8 +230,26 @@
   function requestLiveCall() {
     if (state.controlConnection && state.controlConnection.open) {
       window.setTimeout(() => {
-        state.controlConnection.send({ type: "viewer-ready", viewerId: state.peer.id });
+        if (state.controlConnection && state.controlConnection.open) {
+          state.controlConnection.send({ type: "viewer-ready", viewerId: state.peer.id });
+        }
       }, 1000);
+    }
+  }
+
+  function startReadyLoop() {
+    stopReadyLoop();
+    state.readyTimer = window.setInterval(() => {
+      if (!state.isLive) {
+        requestLiveCall();
+      }
+    }, 3000);
+  }
+
+  function stopReadyLoop() {
+    if (state.readyTimer) {
+      window.clearInterval(state.readyTimer);
+      state.readyTimer = null;
     }
   }
 
