@@ -20,6 +20,7 @@
   const state = {
     peer: null,
     controlConnection: null,
+    currentCall: null,
     reconnectTimer: null,
     muted: true,
     hasAudio: false,
@@ -53,8 +54,19 @@
     });
 
     state.peer.on("call", (call) => {
+      const previousCall = state.currentCall;
+      state.currentCall = call;
+
+      if (previousCall && previousCall !== call) {
+        previousCall.close();
+      }
+
       call.answer();
       call.on("stream", (stream) => {
+        if (state.currentCall !== call) {
+          return;
+        }
+
         video.srcObject = stream;
         state.hasAudio = stream.getAudioTracks().length > 0;
         state.isLive = true;
@@ -66,11 +78,19 @@
       });
 
       call.on("close", () => {
-        stopVideo("Warte auf Stream", "Sender verbunden");
+        if (state.currentCall === call) {
+          state.currentCall = null;
+          stopVideo("Warte auf Stream", "Sender verbunden");
+          requestLiveCall();
+        }
       });
 
       call.on("error", () => {
-        stopVideo("Warte auf Stream", "Verbindung unterbrochen");
+        if (state.currentCall === call) {
+          state.currentCall = null;
+          stopVideo("Warte auf Stream", "Verbindung unterbrochen");
+          requestLiveCall();
+        }
       });
     });
 
@@ -154,6 +174,7 @@
 
   function stopVideo(emptyMessage, statusMessage) {
     video.srcObject = null;
+    state.currentCall = null;
     state.hasAudio = false;
     state.isLive = false;
     video.classList.remove("is-live");
@@ -198,6 +219,14 @@
   function setEmpty(text) {
     emptyTitle.textContent = text;
     emptyState.hidden = false;
+  }
+
+  function requestLiveCall() {
+    if (state.controlConnection && state.controlConnection.open) {
+      window.setTimeout(() => {
+        state.controlConnection.send({ type: "viewer-ready", viewerId: state.peer.id });
+      }, 1000);
+    }
   }
 
   function waitForPeerLibrary() {

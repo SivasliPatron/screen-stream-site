@@ -9,6 +9,8 @@
   const ROOM_ID = config.roomId;
   const SENDER_PEER_ID = `${ROOM_ID}-sender`;
   const EXPECTED_SENDER_KEY = config.senderKey;
+  const VIDEO_MAX_BITRATE = 1600000;
+  const AUDIO_MAX_BITRATE = 64000;
 
   const startButton = document.querySelector("#startButton");
   const stopButton = document.querySelector("#stopButton");
@@ -22,7 +24,8 @@
     peer: null,
     stream: null,
     viewerConnections: new Map(),
-    calls: new Map()
+    calls: new Map(),
+    callTimers: new Map()
   };
 
   viewerUrl.textContent = `Zuschauer-Link: ${window.location.origin}${window.location.pathname.replace(/sender\.html$/, "")}`;
@@ -63,13 +66,13 @@
         connection.send({ type: state.stream ? "live" : "waiting" });
 
         if (state.stream) {
-          callViewer(connection.peer);
+          requestCall(connection.peer);
         }
       });
 
       connection.on("data", (message) => {
         if (message && message.type === "viewer-ready" && state.stream) {
-          callViewer(connection.peer);
+          requestCall(connection.peer);
         }
       });
 
@@ -105,9 +108,9 @@
     try {
       state.stream = await navigator.mediaDevices.getDisplayMedia({
         video: {
-          frameRate: { ideal: 30, max: 60 },
-          width: { ideal: 1920 },
-          height: { ideal: 1080 }
+          frameRate: { ideal: 20, max: 24 },
+          width: { ideal: 1280, max: 1280 },
+          height: { ideal: 720, max: 720 }
         },
         audio: true
       });
@@ -117,6 +120,7 @@
     }
 
     previewVideo.srcObject = state.stream;
+    tuneCaptureTracks();
     previewEmpty.hidden = true;
     startButton.disabled = true;
     stopButton.disabled = false;
@@ -129,7 +133,7 @@
     broadcast({ type: "live" });
 
     for (const viewerId of state.viewerConnections.keys()) {
-      callViewer(viewerId);
+      requestCall(viewerId);
     }
   }
 
@@ -149,8 +153,27 @@
       closeCall(viewerId);
     }
 
+    for (const timer of state.callTimers.values()) {
+      window.clearTimeout(timer);
+    }
+
+    state.callTimers.clear();
+
     broadcast({ type: "waiting" });
     setStatus("Bereit");
+  }
+
+  function requestCall(viewerId) {
+    if (state.calls.has(viewerId) || state.callTimers.has(viewerId)) {
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      state.callTimers.delete(viewerId);
+      callViewer(viewerId);
+    }, 250);
+
+    state.callTimers.set(viewerId, timer);
   }
 
   function callViewer(viewerId) {
@@ -158,17 +181,32 @@
       return;
     }
 
-    closeCall(viewerId);
+    if (!state.viewerConnections.has(viewerId)) {
+      return;
+    }
+
+    if (state.calls.has(viewerId)) {
+      return;
+    }
 
     const call = state.peer.call(viewerId, state.stream);
     state.calls.set(viewerId, call);
+    applyCallLimits(call);
 
     call.on("close", () => {
       state.calls.delete(viewerId);
+
+      if (state.stream && state.viewerConnections.has(viewerId)) {
+        requestCall(viewerId);
+      }
     });
 
     call.on("error", () => {
       state.calls.delete(viewerId);
+
+      if (state.stream && state.viewerConnections.has(viewerId)) {
+        requestCall(viewerId);
+      }
     });
   }
 
@@ -181,6 +219,48 @@
 
     call.close();
     state.calls.delete(viewerId);
+  }
+
+  function tuneCaptureTracks() {
+    const [videoTrack] = state.stream.getVideoTracks();
+
+    if (videoTrack && "contentHint" in videoTrack) {
+      videoTrack.contentHint = "detail";
+    }
+
+    const [audioTrack] = state.stream.getAudioTracks();
+
+    if (audioTrack && "contentHint" in audioTrack) {
+      audioTrack.contentHint = "speech";
+    }
+  }
+
+  function applyCallLimits(call) {
+    const peerConnection = call.peerConnection;
+
+    if (!peerConnection || !peerConnection.getSenders) {
+      return;
+    }
+
+    for (const sender of peerConnection.getSenders()) {
+      if (!sender.track || !sender.getParameters || !sender.setParameters) {
+        continue;
+      }
+
+      const parameters = sender.getParameters();
+      parameters.encodings = parameters.encodings && parameters.encodings.length ? parameters.encodings : [{}];
+
+      if (sender.track.kind === "video") {
+        parameters.encodings[0].maxBitrate = VIDEO_MAX_BITRATE;
+        parameters.encodings[0].maxFramerate = 20;
+      }
+
+      if (sender.track.kind === "audio") {
+        parameters.encodings[0].maxBitrate = AUDIO_MAX_BITRATE;
+      }
+
+      sender.setParameters(parameters).catch(() => {});
+    }
   }
 
   function broadcast(message) {
