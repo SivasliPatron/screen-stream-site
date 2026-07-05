@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Live Bildschirm</title>
+    <link rel="stylesheet" href="./styles.css">
+    <script src="./config.js" defer></script>
+    <script src="https://unpkg.com/peerjs@1.5.5/dist/peerjs.min.js" defer></script>
+    <script src="./viewer.js" defer></script>
+  </head>
+  <body class="viewer-page">
+    <main class="viewer-shell">
+      <section class="stream-stage" aria-label="Live Bildschirm">
+        <video id="streamVideo" autoplay playsinline></video>
+
+        <div id="emptyState" class="empty-state">
+          <span id="emptyTitle">Stream ist offline</span>
+        </div>
+
+        <div class="stream-bar">
+          <div id="statusText" class="status-text">Verbindung wird aufgebaut</div>
+          <button id="muteButton" class="icon-button" type="button" aria-label="Ton einschalten" title="Ton einschalten">
+            <svg id="volumeOnIcon" aria-hidden="true" class="button-icon" viewBox="0 0 24 24">
+              <path d="M11 5 6 9H3v6h3l5 4V5Z"></path>
+              <path d="M15.5 8.5a5 5 0 0 1 0 7"></path>
+              <path d="M18.5 5.5a9 9 0 0 1 0 13"></path>
+            </svg>
+            <svg id="volumeOffIcon" aria-hidden="true" class="button-icon" viewBox="0 0 24 24">
+              <path d="M11 5 6 9H3v6h3l5 4V5Z"></path>
+              <path d="m16 9 5 5"></path>
+              <path d="m21 9-5 5"></path>
+            </svg>
+            <span id="muteText">Ton an</span>
+          </button>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>

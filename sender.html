@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Bildschirm senden</title>
+    <link rel="stylesheet" href="./styles.css">
+    <script src="./config.js" defer></script>
+    <script src="https://unpkg.com/peerjs@1.5.5/dist/peerjs.min.js" defer></script>
+    <script src="./sender.js" defer></script>
+  </head>
+  <body class="sender-page">
+    <main class="sender-shell">
+      <section class="sender-toolbar" aria-label="Sender">
+        <div class="sender-copy">
+          <p class="eyebrow">Sender</p>
+          <h1>Bildschirm senden</h1>
+          <p id="senderStatus" class="sender-status">Verbindung wird aufgebaut</p>
+        </div>
+        <div class="sender-actions">
+          <button id="startButton" class="primary-button" type="button" disabled>
+            <svg aria-hidden="true" class="button-icon" viewBox="0 0 24 24">
+              <path d="M8 5v14l11-7L8 5Z"></path>
+            </svg>
+            <span>Start</span>
+          </button>
+          <button id="stopButton" class="secondary-button" type="button" disabled>
+            <svg aria-hidden="true" class="button-icon" viewBox="0 0 24 24">
+              <path d="M7 7h10v10H7z"></path>
+            </svg>
+            <span>Stop</span>
+          </button>
+        </div>
+      </section>
+
+      <section class="preview-stage" aria-label="Vorschau">
+        <video id="previewVideo" autoplay muted playsinline></video>
+        <div id="previewEmpty" class="empty-state">
+          <span>Kein Bildschirm ausgewaehlt</span>
+        </div>
+      </section>
+
+      <section class="sender-footer" aria-label="Stream Status">
+        <span id="viewerCount">0 Zuschauer</span>
+        <span id="viewerUrl"></span>
+      </section>
+    </main>
+  </body>
+</html>
