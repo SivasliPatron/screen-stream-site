@@ -3,6 +3,7 @@
   const RETRY_MS = 2500;
   const READY_MS = 3000;
   const OFFER_RETRY_MS = 9000;
+  const CONNECT_TIMEOUT_MS = 12000;
   const ICE_SERVERS = [
     { urls: "stun:stun.l.google.com:19302" },
     { urls: "stun:stun1.l.google.com:19302" },
@@ -13,12 +14,22 @@
       credential: "openrelayproject"
     },
     {
+      urls: "turn:openrelay.metered.ca:80?transport=tcp",
+      username: "openrelayproject",
+      credential: "openrelayproject"
+    },
+    {
       urls: "turn:openrelay.metered.ca:443",
       username: "openrelayproject",
       credential: "openrelayproject"
     },
     {
       urls: "turn:openrelay.metered.ca:443?transport=tcp",
+      username: "openrelayproject",
+      credential: "openrelayproject"
+    },
+    {
+      urls: "turns:openrelay.metered.ca:443",
       username: "openrelayproject",
       credential: "openrelayproject"
     }
@@ -42,7 +53,9 @@
     reconnectTimer: null,
     readyTimer: null,
     offerTimer: null,
+    connectTimer: null,
     rtcStartedAt: 0,
+    forceRelay: false,
     muted: true,
     hasAudio: false,
     isLive: false,
@@ -137,6 +150,7 @@
     }
 
     setStatus("Verbinde");
+    state.forceRelay = false;
     requestOffer();
   }
 
@@ -164,7 +178,8 @@
       resetRtc();
     }
 
-    const peerConnection = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+    const forceRelay = state.forceRelay;
+    const peerConnection = new RTCPeerConnection(createRtcConfig(forceRelay));
     state.rtc = peerConnection;
     state.remoteStream = new MediaStream();
     state.pendingCandidates = [];
@@ -172,6 +187,8 @@
 
     peerConnection.addTransceiver("video", { direction: "recvonly" });
     peerConnection.addTransceiver("audio", { direction: "recvonly" });
+
+    startConnectTimeout(peerConnection);
 
     peerConnection.addEventListener("icecandidate", (event) => {
       if (event.candidate) {
@@ -191,6 +208,7 @@
       video.srcObject = state.remoteStream;
       state.hasAudio = state.remoteStream.getAudioTracks().length > 0;
       state.isLive = true;
+      clearConnectTimeout();
       emptyState.hidden = true;
       video.classList.add("is-live");
       setStatus("Live");
@@ -203,20 +221,54 @@
         return;
       }
 
+      if (peerConnection.connectionState === "connected") {
+        clearConnectTimeout();
+        setStatus("Live");
+      }
+
       if (["failed", "closed", "disconnected"].includes(peerConnection.connectionState)) {
         resetRtc();
 
         if (state.senderOnline && state.wantsLive) {
-          setStatus("Verbinde neu");
+          state.forceRelay = true;
+          setStatus("Verbinde ueber Relay");
           requestOffer();
         }
+      }
+    });
+
+    peerConnection.addEventListener("iceconnectionstatechange", () => {
+      if (state.rtc !== peerConnection || state.isLive) {
+        return;
+      }
+
+      if (peerConnection.iceConnectionState === "checking") {
+        setStatus(forceRelay ? "Relay wird geprueft" : "Verbindung wird geprueft");
+      }
+
+      if (peerConnection.iceConnectionState === "connected" || peerConnection.iceConnectionState === "completed") {
+        clearConnectTimeout();
+        setStatus("Live");
+      }
+
+      if (peerConnection.iceConnectionState === "failed") {
+        resetRtc();
+        state.forceRelay = true;
+        setStatus("Verbinde ueber Relay");
+        requestOffer();
       }
     });
 
     try {
       const offer = await peerConnection.createOffer();
       await peerConnection.setLocalDescription(offer);
-      send({ type: "offer", payload: peerConnection.localDescription });
+      send({
+        type: "offer",
+        payload: {
+          description: peerConnection.localDescription,
+          forceRelay
+        }
+      });
     } catch {
       resetRtc();
       setStatus("Verbindung fehlgeschlagen");
@@ -254,6 +306,8 @@
   }
 
   function resetRtc() {
+    clearConnectTimeout();
+
     if (state.rtc) {
       state.rtc.close();
     }
@@ -268,6 +322,27 @@
     video.classList.remove("is-live");
     emptyState.hidden = false;
     updateMuteButton();
+  }
+
+  function startConnectTimeout(peerConnection) {
+    clearConnectTimeout();
+    state.connectTimer = window.setTimeout(() => {
+      if (state.rtc !== peerConnection || state.isLive) {
+        return;
+      }
+
+      resetRtc();
+      state.forceRelay = true;
+      setStatus("Verbinde ueber Relay");
+      requestOffer();
+    }, CONNECT_TIMEOUT_MS);
+  }
+
+  function clearConnectTimeout() {
+    if (state.connectTimer) {
+      window.clearTimeout(state.connectTimer);
+      state.connectTimer = null;
+    }
   }
 
   function scheduleReconnect() {
@@ -353,6 +428,13 @@
     });
 
     return `${protocol}//${window.location.host}/ws?${params.toString()}`;
+  }
+
+  function createRtcConfig(forceRelay) {
+    return {
+      iceServers: ICE_SERVERS,
+      iceTransportPolicy: forceRelay ? "relay" : "all"
+    };
   }
 
   function setStatus(text) {

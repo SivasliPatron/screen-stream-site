@@ -1,6 +1,7 @@
 (function () {
   const ROOM_ID = "main";
   const LIVE_PULSE_MS = 3000;
+  const CONNECT_TIMEOUT_MS = 15000;
   const VIDEO_MAX_BITRATE = 2200000;
   const AUDIO_MAX_BITRATE = 64000;
   const ICE_SERVERS = [
@@ -13,12 +14,22 @@
       credential: "openrelayproject"
     },
     {
+      urls: "turn:openrelay.metered.ca:80?transport=tcp",
+      username: "openrelayproject",
+      credential: "openrelayproject"
+    },
+    {
       urls: "turn:openrelay.metered.ca:443",
       username: "openrelayproject",
       credential: "openrelayproject"
     },
     {
       urls: "turn:openrelay.metered.ca:443?transport=tcp",
+      username: "openrelayproject",
+      credential: "openrelayproject"
+    },
+    {
+      urls: "turns:openrelay.metered.ca:443",
       username: "openrelayproject",
       credential: "openrelayproject"
     }
@@ -202,11 +213,14 @@
     setStatus(state.accepted ? "Bereit" : "Sender offline");
   }
 
-  async function handleViewerOffer(viewerId, offer) {
+  async function handleViewerOffer(viewerId, offerPayload) {
     if (!state.stream || !viewerId) {
       sendStreamState(false);
       return;
     }
+
+    const offer = offerPayload && offerPayload.description ? offerPayload.description : offerPayload;
+    const forceRelay = Boolean(offerPayload && offerPayload.forceRelay);
 
     if (!offer) {
       return;
@@ -215,8 +229,9 @@
     closeViewerRtc(viewerId);
     state.pendingCandidates.set(viewerId, []);
 
-    const peerConnection = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+    const peerConnection = new RTCPeerConnection(createRtcConfig(forceRelay));
     state.rtcPeers.set(viewerId, peerConnection);
+    setStatus(forceRelay ? `Live - Relay fuer ${state.viewers.size} Zuschauer` : "Live");
 
     state.stream.getTracks().forEach((track) => {
       peerConnection.addTrack(track, state.stream);
@@ -230,12 +245,42 @@
       }
     });
 
+    const connectTimer = window.setTimeout(() => {
+      if (state.rtcPeers.get(viewerId) === peerConnection) {
+        closeViewerRtc(viewerId);
+        sendStreamState(Boolean(state.stream));
+      }
+    }, CONNECT_TIMEOUT_MS);
+
     peerConnection.addEventListener("connectionstatechange", () => {
       if (state.rtcPeers.get(viewerId) !== peerConnection) {
         return;
       }
 
+      if (peerConnection.connectionState === "connected") {
+        window.clearTimeout(connectTimer);
+        setStatus("Live");
+      }
+
       if (["failed", "closed", "disconnected"].includes(peerConnection.connectionState)) {
+        window.clearTimeout(connectTimer);
+        closeViewerRtc(viewerId);
+        sendStreamState(Boolean(state.stream));
+      }
+    });
+
+    peerConnection.addEventListener("iceconnectionstatechange", () => {
+      if (state.rtcPeers.get(viewerId) !== peerConnection) {
+        return;
+      }
+
+      if (peerConnection.iceConnectionState === "connected" || peerConnection.iceConnectionState === "completed") {
+        window.clearTimeout(connectTimer);
+        setStatus("Live");
+      }
+
+      if (peerConnection.iceConnectionState === "failed") {
+        window.clearTimeout(connectTimer);
         closeViewerRtc(viewerId);
         sendStreamState(Boolean(state.stream));
       }
@@ -381,6 +426,13 @@
     });
 
     return `${protocol}//${window.location.host}/ws?${params.toString()}`;
+  }
+
+  function createRtcConfig(forceRelay) {
+    return {
+      iceServers: ICE_SERVERS,
+      iceTransportPolicy: forceRelay ? "relay" : "all"
+    };
   }
 
   function updateViewerCount() {
