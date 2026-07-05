@@ -9,7 +9,7 @@
   const ROOM_ID = config.roomId;
   const SENDER_PEER_ID = `${ROOM_ID}-sender`;
   const EXPECTED_SENDER_KEY = config.senderKey;
-  const VIDEO_MAX_BITRATE = 1600000;
+  const VIDEO_MAX_BITRATE = 2200000;
   const AUDIO_MAX_BITRATE = 64000;
 
   const startButton = document.querySelector("#startButton");
@@ -108,9 +108,9 @@
     try {
       state.stream = await navigator.mediaDevices.getDisplayMedia({
         video: {
-          frameRate: { ideal: 20, max: 24 },
-          width: { ideal: 1280, max: 1280 },
-          height: { ideal: 720, max: 720 }
+          frameRate: { ideal: 60, max: 60 },
+          width: { ideal: 854, max: 854 },
+          height: { ideal: 480, max: 480 }
         },
         audio: true
       });
@@ -252,7 +252,7 @@
 
       if (sender.track.kind === "video") {
         parameters.encodings[0].maxBitrate = VIDEO_MAX_BITRATE;
-        parameters.encodings[0].maxFramerate = 20;
+        parameters.encodings[0].maxFramerate = 60;
       }
 
       if (sender.track.kind === "audio") {
