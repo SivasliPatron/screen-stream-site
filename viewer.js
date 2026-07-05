@@ -7,6 +7,28 @@
   const ROOM_ID = config.roomId;
   const SENDER_PEER_ID = `${ROOM_ID}-sender`;
   const RETRY_MS = 2500;
+  const READY_MS = 3000;
+  const OFFER_RETRY_MS = 9000;
+  const ICE_SERVERS = [
+    { urls: "stun:stun.l.google.com:19302" },
+    { urls: "stun:stun1.l.google.com:19302" },
+    { urls: "stun:openrelay.metered.ca:80" },
+    {
+      urls: "turn:openrelay.metered.ca:80",
+      username: "openrelayproject",
+      credential: "openrelayproject"
+    },
+    {
+      urls: "turn:openrelay.metered.ca:443",
+      username: "openrelayproject",
+      credential: "openrelayproject"
+    },
+    {
+      urls: "turn:openrelay.metered.ca:443?transport=tcp",
+      username: "openrelayproject",
+      credential: "openrelayproject"
+    }
+  ];
 
   const video = document.querySelector("#streamVideo");
   const emptyState = document.querySelector("#emptyState");
@@ -20,12 +42,17 @@
   const state = {
     peer: null,
     controlConnection: null,
-    currentCall: null,
-    readyTimer: null,
+    rtc: null,
+    remoteStream: null,
+    pendingCandidates: [],
     reconnectTimer: null,
+    readyTimer: null,
+    offerTimer: null,
+    rtcStartedAt: 0,
     muted: true,
     hasAudio: false,
-    isLive: false
+    isLive: false,
+    wantsLive: false
   };
 
   video.controls = false;
@@ -41,58 +68,12 @@
   function startViewer() {
     state.peer = new Peer(undefined, {
       debug: 1,
-      config: {
-        iceServers: [
-          { urls: "stun:stun.l.google.com:19302" },
-          { urls: "stun:stun1.l.google.com:19302" }
-        ]
-      }
+      config: { iceServers: ICE_SERVERS }
     });
 
     state.peer.on("open", () => {
       setStatus("Suche Stream");
       connectToSender();
-    });
-
-    state.peer.on("call", (call) => {
-      const previousCall = state.currentCall;
-      state.currentCall = call;
-
-      if (previousCall && previousCall !== call) {
-        previousCall.close();
-      }
-
-      call.answer();
-      call.on("stream", (stream) => {
-        if (state.currentCall !== call) {
-          return;
-        }
-
-        video.srcObject = stream;
-        state.hasAudio = stream.getAudioTracks().length > 0;
-        state.isLive = true;
-        emptyState.hidden = true;
-        video.classList.add("is-live");
-        setStatus("Live");
-        updateMuteButton();
-        video.play().catch(() => setStatus("Bereit"));
-      });
-
-      call.on("close", () => {
-        if (state.currentCall === call) {
-          state.currentCall = null;
-          stopVideo("Warte auf Stream", "Sender verbunden");
-          requestLiveCall();
-        }
-      });
-
-      call.on("error", () => {
-        if (state.currentCall === call) {
-          state.currentCall = null;
-          stopVideo("Warte auf Stream", "Verbindung unterbrochen");
-          requestLiveCall();
-        }
-      });
     });
 
     state.peer.on("disconnected", () => {
@@ -101,6 +82,7 @@
     });
 
     state.peer.on("error", () => {
+      setStatus("Sender wird gesucht");
       scheduleReconnect();
     });
 
@@ -127,7 +109,7 @@
     connection.on("open", () => {
       setStatus("Sender verbunden");
       setEmpty("Warte auf Stream");
-      requestLiveCall();
+      sendReady();
       startReadyLoop();
     });
 
@@ -136,31 +118,191 @@
         return;
       }
 
-      if (message.type === "offline") {
-        stopVideo("Stream ist offline", "Sender offline");
+      if (message.type === "waiting") {
+        state.wantsLive = false;
+        resetRtc();
+        setEmpty("Warte auf Stream");
+        setStatus("Sender verbunden");
       }
 
-      if (message.type === "waiting") {
-        stopVideo("Warte auf Stream", "Sender verbunden");
+      if (message.type === "offline") {
+        state.wantsLive = false;
+        resetRtc();
+        setEmpty("Sender wird gesucht");
+        setStatus("Sender offline");
       }
 
       if (message.type === "live") {
+        state.wantsLive = true;
         setStatus("Verbinde");
-        requestLiveCall();
+        requestOffer();
+      }
+
+      if (message.type === "sender-answer") {
+        handleAnswer(message.payload);
+      }
+
+      if (message.type === "sender-ice") {
+        addRemoteCandidate(message.payload);
       }
     });
 
     connection.on("close", () => {
+      if (state.controlConnection !== connection) {
+        return;
+      }
+
+      state.controlConnection = null;
       stopReadyLoop();
-      stopVideo("Sender wird gesucht", "Sender offline");
+      state.wantsLive = false;
+      resetRtc();
+      setEmpty("Sender wird gesucht");
+      setStatus("Sender offline");
       scheduleReconnect();
     });
 
     connection.on("error", () => {
+      if (state.controlConnection !== connection) {
+        return;
+      }
+
       stopReadyLoop();
       setStatus("Sender offline");
       scheduleReconnect();
     });
+  }
+
+  function requestOffer() {
+    if (state.offerTimer) {
+      return;
+    }
+
+    state.offerTimer = window.setTimeout(() => {
+      state.offerTimer = null;
+      createOffer();
+    }, 200);
+  }
+
+  async function createOffer() {
+    if (!state.controlConnection || !state.controlConnection.open || !state.peer || !state.peer.id) {
+      return;
+    }
+
+    if (state.rtc && !["failed", "closed", "disconnected"].includes(state.rtc.connectionState)) {
+      if (Date.now() - state.rtcStartedAt < OFFER_RETRY_MS) {
+        return;
+      }
+
+      resetRtc();
+    }
+
+    const peerConnection = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+    state.rtc = peerConnection;
+    state.remoteStream = new MediaStream();
+    state.pendingCandidates = [];
+    state.rtcStartedAt = Date.now();
+
+    peerConnection.addTransceiver("video", { direction: "recvonly" });
+    peerConnection.addTransceiver("audio", { direction: "recvonly" });
+
+    peerConnection.onicecandidate = (event) => {
+      if (event.candidate) {
+        sendControl({ type: "viewer-ice", payload: event.candidate });
+      }
+    };
+
+    peerConnection.ontrack = (event) => {
+      if (state.rtc !== peerConnection) {
+        return;
+      }
+
+      if (!state.remoteStream.getTracks().includes(event.track)) {
+        state.remoteStream.addTrack(event.track);
+      }
+
+      video.srcObject = state.remoteStream;
+      state.hasAudio = state.remoteStream.getAudioTracks().length > 0;
+      state.isLive = true;
+      emptyState.hidden = true;
+      video.classList.add("is-live");
+      setStatus("Live");
+      updateMuteButton();
+      video.play().catch(() => setStatus("Bereit"));
+    };
+
+    peerConnection.onconnectionstatechange = () => {
+      if (state.rtc !== peerConnection) {
+        return;
+      }
+
+      if (["failed", "closed", "disconnected"].includes(peerConnection.connectionState)) {
+        resetRtc();
+
+        if (state.wantsLive) {
+          setStatus("Verbinde neu");
+          requestOffer();
+        }
+      }
+    };
+
+    try {
+      const offer = await peerConnection.createOffer();
+      await peerConnection.setLocalDescription(offer);
+      sendControl({ type: "viewer-offer", payload: peerConnection.localDescription });
+    } catch {
+      resetRtc();
+      setStatus("Verbindung fehlgeschlagen");
+    }
+  }
+
+  async function handleAnswer(answer) {
+    if (!state.rtc || !answer) {
+      return;
+    }
+
+    try {
+      await state.rtc.setRemoteDescription(answer);
+
+      for (const candidate of state.pendingCandidates.splice(0)) {
+        await state.rtc.addIceCandidate(candidate).catch(() => {});
+      }
+    } catch {
+      resetRtc();
+      setStatus("Verbindung fehlgeschlagen");
+    }
+  }
+
+  async function addRemoteCandidate(candidate) {
+    if (!candidate || !state.rtc) {
+      return;
+    }
+
+    if (!state.rtc.remoteDescription) {
+      state.pendingCandidates.push(candidate);
+      return;
+    }
+
+    await state.rtc.addIceCandidate(candidate).catch(() => {});
+  }
+
+  function resetRtc() {
+    if (state.rtc) {
+      state.rtc.onicecandidate = null;
+      state.rtc.ontrack = null;
+      state.rtc.onconnectionstatechange = null;
+      state.rtc.close();
+    }
+
+    state.rtc = null;
+    state.remoteStream = null;
+    state.pendingCandidates = [];
+    state.rtcStartedAt = 0;
+    state.hasAudio = false;
+    state.isLive = false;
+    video.srcObject = null;
+    video.classList.remove("is-live");
+    emptyState.hidden = false;
+    updateMuteButton();
   }
 
   function scheduleReconnect() {
@@ -178,16 +320,32 @@
     state.controlConnection = null;
   }
 
-  function stopVideo(emptyMessage, statusMessage) {
-    video.srcObject = null;
-    state.currentCall = null;
-    state.hasAudio = false;
-    state.isLive = false;
-    video.classList.remove("is-live");
-    emptyState.hidden = false;
-    setEmpty(emptyMessage);
-    setStatus(statusMessage);
-    updateMuteButton();
+  function sendReady() {
+    sendControl({ type: "viewer-ready", viewerId: state.peer && state.peer.id });
+  }
+
+  function sendControl(message) {
+    if (state.controlConnection && state.controlConnection.open) {
+      state.controlConnection.send(message);
+    }
+  }
+
+  function startReadyLoop() {
+    stopReadyLoop();
+    state.readyTimer = window.setInterval(() => {
+      sendReady();
+
+      if (state.wantsLive && !state.isLive) {
+        requestOffer();
+      }
+    }, READY_MS);
+  }
+
+  function stopReadyLoop() {
+    if (state.readyTimer) {
+      window.clearInterval(state.readyTimer);
+      state.readyTimer = null;
+    }
   }
 
   function toggleMute() {
@@ -225,32 +383,6 @@
   function setEmpty(text) {
     emptyTitle.textContent = text;
     emptyState.hidden = false;
-  }
-
-  function requestLiveCall() {
-    if (state.controlConnection && state.controlConnection.open) {
-      window.setTimeout(() => {
-        if (state.controlConnection && state.controlConnection.open) {
-          state.controlConnection.send({ type: "viewer-ready", viewerId: state.peer.id });
-        }
-      }, 1000);
-    }
-  }
-
-  function startReadyLoop() {
-    stopReadyLoop();
-    state.readyTimer = window.setInterval(() => {
-      if (!state.isLive) {
-        requestLiveCall();
-      }
-    }, 3000);
-  }
-
-  function stopReadyLoop() {
-    if (state.readyTimer) {
-      window.clearInterval(state.readyTimer);
-      state.readyTimer = null;
-    }
   }
 
   function waitForPeerLibrary() {

@@ -11,6 +11,26 @@
   const EXPECTED_SENDER_KEY = config.senderKey;
   const VIDEO_MAX_BITRATE = 2200000;
   const AUDIO_MAX_BITRATE = 64000;
+  const ICE_SERVERS = [
+    { urls: "stun:stun.l.google.com:19302" },
+    { urls: "stun:stun1.l.google.com:19302" },
+    { urls: "stun:openrelay.metered.ca:80" },
+    {
+      urls: "turn:openrelay.metered.ca:80",
+      username: "openrelayproject",
+      credential: "openrelayproject"
+    },
+    {
+      urls: "turn:openrelay.metered.ca:443",
+      username: "openrelayproject",
+      credential: "openrelayproject"
+    },
+    {
+      urls: "turn:openrelay.metered.ca:443?transport=tcp",
+      username: "openrelayproject",
+      credential: "openrelayproject"
+    }
+  ];
 
   const startButton = document.querySelector("#startButton");
   const stopButton = document.querySelector("#stopButton");
@@ -24,8 +44,8 @@
     peer: null,
     stream: null,
     viewerConnections: new Map(),
-    calls: new Map(),
-    callTimers: new Map(),
+    rtcPeers: new Map(),
+    pendingCandidates: new Map(),
     liveTimer: null
   };
 
@@ -46,12 +66,7 @@
   function startSender() {
     state.peer = new Peer(SENDER_PEER_ID, {
       debug: 1,
-      config: {
-        iceServers: [
-          { urls: "stun:stun.l.google.com:19302" },
-          { urls: "stun:stun1.l.google.com:19302" }
-        ]
-      }
+      config: { iceServers: ICE_SERVERS }
     });
 
     state.peer.on("open", () => {
@@ -60,33 +75,53 @@
     });
 
     state.peer.on("connection", (connection) => {
+      const existing = state.viewerConnections.get(connection.peer);
+
+      if (existing && existing !== connection) {
+        existing.close();
+      }
+
       state.viewerConnections.set(connection.peer, connection);
       updateViewerCount();
 
       connection.on("open", () => {
-        connection.send({ type: state.stream ? "live" : "waiting" });
-
-        if (state.stream) {
-          requestCall(connection.peer);
-        }
+        sendToViewer(connection.peer, { type: state.stream ? "live" : "waiting" });
       });
 
       connection.on("data", (message) => {
-        if (message && message.type === "viewer-ready" && state.stream) {
-          requestCall(connection.peer);
+        if (!message || typeof message !== "object") {
+          return;
+        }
+
+        if (message.type === "viewer-ready") {
+          sendToViewer(connection.peer, { type: state.stream ? "live" : "waiting" });
+        }
+
+        if (message.type === "viewer-offer") {
+          handleViewerOffer(connection.peer, message.payload);
+        }
+
+        if (message.type === "viewer-ice") {
+          addRemoteCandidate(connection.peer, message.payload);
         }
       });
 
       connection.on("close", () => {
-        state.viewerConnections.delete(connection.peer);
-        closeCall(connection.peer);
-        updateViewerCount();
+        if (state.viewerConnections.get(connection.peer) === connection) {
+          state.viewerConnections.delete(connection.peer);
+          closeViewerRtc(connection.peer);
+          state.pendingCandidates.delete(connection.peer);
+          updateViewerCount();
+        }
       });
 
       connection.on("error", () => {
-        state.viewerConnections.delete(connection.peer);
-        closeCall(connection.peer);
-        updateViewerCount();
+        if (state.viewerConnections.get(connection.peer) === connection) {
+          state.viewerConnections.delete(connection.peer);
+          closeViewerRtc(connection.peer);
+          state.pendingCandidates.delete(connection.peer);
+          updateViewerCount();
+        }
       });
     });
 
@@ -133,10 +168,6 @@
 
     broadcast({ type: "live" });
     startLivePulse();
-
-    for (const viewerId of state.viewerConnections.keys()) {
-      requestCall(viewerId);
-    }
   }
 
   function stopStream() {
@@ -151,77 +182,148 @@
     startButton.disabled = false;
     stopButton.disabled = true;
 
-    for (const viewerId of Array.from(state.calls.keys())) {
-      closeCall(viewerId);
+    for (const viewerId of Array.from(state.rtcPeers.keys())) {
+      closeViewerRtc(viewerId);
     }
 
-    for (const timer of state.callTimers.values()) {
-      window.clearTimeout(timer);
-    }
-
-    state.callTimers.clear();
+    state.pendingCandidates.clear();
     stopLivePulse();
-
     broadcast({ type: "waiting" });
     setStatus("Bereit");
   }
 
-  function requestCall(viewerId) {
-    if (state.calls.has(viewerId) || state.callTimers.has(viewerId)) {
+  async function handleViewerOffer(viewerId, offer) {
+    if (!state.stream) {
+      sendToViewer(viewerId, { type: "waiting" });
       return;
     }
 
-    const timer = window.setTimeout(() => {
-      state.callTimers.delete(viewerId);
-      callViewer(viewerId);
-    }, 250);
-
-    state.callTimers.set(viewerId, timer);
-  }
-
-  function callViewer(viewerId) {
-    if (!state.peer || !state.stream || !viewerId) {
+    if (!offer) {
       return;
     }
 
-    if (!state.viewerConnections.has(viewerId)) {
-      return;
-    }
+    closeViewerRtc(viewerId);
+    state.pendingCandidates.set(viewerId, []);
 
-    if (state.calls.has(viewerId)) {
-      return;
-    }
+    const peerConnection = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+    state.rtcPeers.set(viewerId, peerConnection);
 
-    const call = state.peer.call(viewerId, state.stream);
-    state.calls.set(viewerId, call);
-    applyCallLimits(call);
-
-    call.on("close", () => {
-      state.calls.delete(viewerId);
-
-      if (state.stream && state.viewerConnections.has(viewerId)) {
-        requestCall(viewerId);
-      }
+    state.stream.getTracks().forEach((track) => {
+      peerConnection.addTrack(track, state.stream);
     });
 
-    call.on("error", () => {
-      state.calls.delete(viewerId);
+    applyPeerLimits(peerConnection);
 
-      if (state.stream && state.viewerConnections.has(viewerId)) {
-        requestCall(viewerId);
+    peerConnection.onicecandidate = (event) => {
+      if (event.candidate) {
+        sendToViewer(viewerId, { type: "sender-ice", payload: event.candidate });
       }
-    });
+    };
+
+    peerConnection.onconnectionstatechange = () => {
+      if (state.rtcPeers.get(viewerId) !== peerConnection) {
+        return;
+      }
+
+      if (["failed", "closed", "disconnected"].includes(peerConnection.connectionState)) {
+        closeViewerRtc(viewerId);
+
+        if (state.stream && state.viewerConnections.has(viewerId)) {
+          window.setTimeout(() => sendToViewer(viewerId, { type: "live" }), 1000);
+        }
+      }
+    };
+
+    try {
+      await peerConnection.setRemoteDescription(offer);
+      await flushPendingCandidates(viewerId, peerConnection);
+
+      const answer = await peerConnection.createAnswer();
+      await peerConnection.setLocalDescription(answer);
+      sendToViewer(viewerId, { type: "sender-answer", payload: peerConnection.localDescription });
+    } catch {
+      closeViewerRtc(viewerId);
+      sendToViewer(viewerId, { type: "live" });
+    }
   }
 
-  function closeCall(viewerId) {
-    const call = state.calls.get(viewerId);
-
-    if (!call) {
+  async function addRemoteCandidate(viewerId, candidate) {
+    if (!candidate) {
       return;
     }
 
-    call.close();
-    state.calls.delete(viewerId);
+    const peerConnection = state.rtcPeers.get(viewerId);
+
+    if (!peerConnection || !peerConnection.remoteDescription) {
+      const pending = state.pendingCandidates.get(viewerId) || [];
+      pending.push(candidate);
+      state.pendingCandidates.set(viewerId, pending);
+      return;
+    }
+
+    await peerConnection.addIceCandidate(candidate).catch(() => {});
+  }
+
+  async function flushPendingCandidates(viewerId, peerConnection) {
+    const pending = state.pendingCandidates.get(viewerId) || [];
+    state.pendingCandidates.set(viewerId, []);
+
+    for (const candidate of pending) {
+      await peerConnection.addIceCandidate(candidate).catch(() => {});
+    }
+  }
+
+  function closeViewerRtc(viewerId) {
+    const peerConnection = state.rtcPeers.get(viewerId);
+
+    if (!peerConnection) {
+      return;
+    }
+
+    peerConnection.onicecandidate = null;
+    peerConnection.onconnectionstatechange = null;
+    peerConnection.close();
+    state.rtcPeers.delete(viewerId);
+  }
+
+  function sendToViewer(viewerId, message) {
+    const connection = state.viewerConnections.get(viewerId);
+
+    if (connection && connection.open) {
+      connection.send(message);
+    }
+  }
+
+  function broadcast(message) {
+    for (const [viewerId, connection] of state.viewerConnections) {
+      if (connection.open) {
+        connection.send(message);
+      } else {
+        state.viewerConnections.delete(viewerId);
+        closeViewerRtc(viewerId);
+      }
+    }
+
+    updateViewerCount();
+  }
+
+  function startLivePulse() {
+    stopLivePulse();
+    state.liveTimer = window.setInterval(() => {
+      if (!state.stream) {
+        stopLivePulse();
+        return;
+      }
+
+      broadcast({ type: "live" });
+    }, 3000);
+  }
+
+  function stopLivePulse() {
+    if (state.liveTimer) {
+      window.clearInterval(state.liveTimer);
+      state.liveTimer = null;
+    }
   }
 
   function tuneCaptureTracks() {
@@ -238,9 +340,7 @@
     }
   }
 
-  function applyCallLimits(call) {
-    const peerConnection = call.peerConnection;
-
+  function applyPeerLimits(peerConnection) {
     if (!peerConnection || !peerConnection.getSenders) {
       return;
     }
@@ -263,37 +363,6 @@
       }
 
       sender.setParameters(parameters).catch(() => {});
-    }
-  }
-
-  function broadcast(message) {
-    for (const connection of state.viewerConnections.values()) {
-      if (connection.open) {
-        connection.send(message);
-      }
-    }
-  }
-
-  function startLivePulse() {
-    stopLivePulse();
-    state.liveTimer = window.setInterval(() => {
-      if (!state.stream) {
-        stopLivePulse();
-        return;
-      }
-
-      broadcast({ type: "live" });
-
-      for (const viewerId of state.viewerConnections.keys()) {
-        requestCall(viewerId);
-      }
-    }, 3000);
-  }
-
-  function stopLivePulse() {
-    if (state.liveTimer) {
-      window.clearInterval(state.liveTimer);
-      state.liveTimer = null;
     }
   }
 
